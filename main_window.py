@@ -1967,6 +1967,10 @@ class PhotosTabWidget(QWidget):
         self.btn_remove_selected.setStyleSheet("QPushButton { padding: 4px; font-size: 12px; background-color: transparent; border: none; } QPushButton:hover { background-color: #333333; border-radius: 4px; }")
         
         add_photos_icon_path = os.path.join(get_base_dir(), "interface element", "add photos.svg")
+        if not os.path.exists(add_photos_icon_path) and hasattr(sys, '_MEIPASS'):
+            candidate = os.path.join(sys._MEIPASS, "interface element", "add photos.svg")
+            if os.path.exists(candidate):
+                add_photos_icon_path = candidate
         self.btn_add_photos = QPushButton("", self.toolbar)
         self.btn_add_photos.setIcon(QIcon(add_photos_icon_path))
         self.btn_add_photos.setIconSize(QSize(20, 20))

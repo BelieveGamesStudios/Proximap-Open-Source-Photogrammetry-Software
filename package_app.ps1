@@ -83,9 +83,9 @@ $excludes = @(
 )
 
 if ($iconFlag) {
-    python -m PyInstaller --onedir --noconsole $iconFlag --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "models;models" $excludes main_window.py
+    python -m PyInstaller --onedir --noconsole $iconFlag --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
 } else {
-    python -m PyInstaller --onedir --noconsole --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "models;models" $excludes main_window.py
+    python -m PyInstaller --onedir --noconsole --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
 }
 
 
@@ -179,6 +179,14 @@ if (Test-Path "public") {
     Copy-Item -Path "public" -Destination "dist/Proximap/public" -Recurse
 } else {
     Write-Warning "Public directory not found. UI icons will fail to load."
+}
+
+# Copy interface element directory containing SVG toolbar icons
+Write-Host "  Copying interface element icons..." -ForegroundColor DarkGray
+if (Test-Path "interface element") {
+    Copy-Item -Path "interface element" -Destination "dist/Proximap/interface element" -Recurse
+} else {
+    Write-Warning "interface element directory not found. UI icons will fail to load."
 }
 
 # Copy offline background removal models

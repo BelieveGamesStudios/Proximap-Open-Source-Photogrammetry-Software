@@ -100,7 +100,10 @@ python3 -m PyInstaller --windowed --noconsole $ICON_FLAG --name Proximap \
     --exclude-module PySide6.QtXml \
     --exclude-module matplotlib \
     --add-data "mesh_editor/shaders:mesh_editor/shaders" \
+    --add-data "addons:addons" \
     --add-data "models:models" \
+    --add-data "interface element:interface element" \
+    --add-data "public:public" \
     --add-data "pymeshlab_worker.py:." main_window.py
 
 if [ ! -d "dist/Proximap.app" ]; then
@@ -189,6 +192,13 @@ if [ -d "public" ]; then
     cp -r "public" "$MAC_OS_DIR/"
 else
     echo "  [WARNING] Public directory not found."
+fi
+
+echo "  Copying interface element icons..."
+if [ -d "interface element" ]; then
+    cp -r "interface element" "$MAC_OS_DIR/"
+else
+    echo "  [WARNING] interface element directory not found."
 fi
 
 echo "  Copying offline AI models..."

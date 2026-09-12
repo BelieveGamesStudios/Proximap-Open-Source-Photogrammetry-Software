@@ -10,6 +10,7 @@ Provides:
 """
 
 import os
+import sys
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
@@ -26,6 +27,8 @@ from PySide6.QtWidgets import (
 
 def get_base_dir() -> str:
     """Returns absolute path to the Proximap root directory."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -34,15 +37,20 @@ def load_tinted_svg_icon(svg_path: Optional[str], color_hex: str = "#E0E0E0", si
     if not svg_path:
         return QIcon()
 
-    if not os.path.isabs(svg_path):
-        svg_path = os.path.join(get_base_dir(), svg_path)
+    resolved_path = svg_path
+    if not os.path.isabs(resolved_path):
+        resolved_path = os.path.join(get_base_dir(), svg_path)
+        if not os.path.exists(resolved_path) and hasattr(sys, '_MEIPASS'):
+            candidate = os.path.join(sys._MEIPASS, svg_path)
+            if os.path.exists(candidate):
+                resolved_path = candidate
 
-    if not os.path.exists(svg_path):
+    if not os.path.exists(resolved_path):
         return QIcon()
 
-    renderer = QSvgRenderer(svg_path)
+    renderer = QSvgRenderer(resolved_path)
     if not renderer.isValid():
-        return QIcon(svg_path)
+        return QIcon(resolved_path)
 
     pixmap = QPixmap(size, size)
     pixmap.fill(QColor(0, 0, 0, 0))  # Transparent background

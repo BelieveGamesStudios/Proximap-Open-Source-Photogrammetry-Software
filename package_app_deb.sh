@@ -133,6 +133,8 @@ python3 -m PyInstaller --windowed --noconsole $ICON_FLAG --name Proximap \
     --add-data "mesh_editor/shaders:mesh_editor/shaders" \
     --add-data "addons:addons" \
     --add-data "models:models" \
+    --add-data "interface element:interface element" \
+    --add-data "public:public" \
     --add-data "pymeshlab_worker.py:." \
     main_window.py
 
@@ -251,6 +253,9 @@ if [ -d "models" ]; then
 fi
 if [ -d "public" ]; then
     cp -r "public" "$OPT_DIR/"
+fi
+if [ -d "interface element" ]; then
+    cp -r "interface element" "$OPT_DIR/"
 fi
 if [ -d "addons" ]; then
     cp -r "addons" "$OPT_DIR/"

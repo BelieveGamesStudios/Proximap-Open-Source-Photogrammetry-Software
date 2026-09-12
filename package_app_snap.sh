@@ -28,6 +28,7 @@ mkdir -p dist/Proximap/backend_bin
 mkdir -p dist/Proximap/_internal/backend_bin
 mkdir -p dist/Proximap/models
 mkdir -p dist/Proximap/public
+mkdir -p "dist/Proximap/interface element"
 
 if [ -d "backend_bin" ]; then
     cp -r backend_bin/* dist/Proximap/backend_bin/ 2>/dev/null || true
@@ -38,6 +39,9 @@ if [ -d "models" ]; then
 fi
 if [ -d "public" ]; then
     cp -r public/* dist/Proximap/public/ 2>/dev/null || true
+fi
+if [ -d "interface element" ]; then
+    cp -r "interface element"/* "dist/Proximap/interface element/" 2>/dev/null || true
 fi
 if [ -f "toolchain_map.json" ]; then
     cp toolchain_map.json dist/Proximap/
