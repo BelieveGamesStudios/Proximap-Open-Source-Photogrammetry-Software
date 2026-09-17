@@ -1,4 +1,5 @@
-<img width="1918" height="1078" alt="Screenshot 2026-06-20 080015" src="https://github.com/user-attachments/assets/62a2b602-45c5-4e54-855d-76c43b8c07e0" />
+<img width="1920" height="1080" alt="Screenshot From 2026-09-17 12-25-38" src="https://github.com/user-attachments/assets/f4968dca-805d-4863-917d-2bd30fcd4326" />
+
 
 <h1>Proximap — Open Source Photogrammetry</h1>
 
