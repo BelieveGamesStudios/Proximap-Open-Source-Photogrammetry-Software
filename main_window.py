@@ -195,7 +195,8 @@ DEFAULT_CAMERA_CONTROLS = (
     "<b>3D Viewport Controls:</b><br>"
     "• Left Click + Drag: Orbit Scene<br>"
     "• Right Click + Drag / Shift + Left Drag: Pan Scene<br>"
-    "• Mouse Scroll: Zoom In / Out"
+    "• Mouse Scroll: Zoom In / Out<br>"
+    "• Gizmo Pill: Toggle Perspective / Orthographic"
 )
 
 from vispy.scene.cameras import TurntableCamera
@@ -2425,6 +2426,8 @@ class MainWindow(QMainWindow):
         self.selection_markers_visual = None
         self.selection_overlay = None
         self.nav_gizmo = None
+        self.projection_toggle = None
+        self._last_perspective_fov = 45.0
         self.floating_toolbox = None
         self.editor_tool_host = None
         self.transform_tool_window = None
@@ -3208,10 +3211,16 @@ class MainWindow(QMainWindow):
 
         # Initialize 3D Navigation Orientation Gizmo for VisPy Viewport (Y-up coordinate system)
         from mesh_editor.nav_gizmo import NavGizmoWidget
+        from camera_projection_toggle import CameraProjectionToggleWidget
         self.nav_gizmo = NavGizmoWidget(self.viewer_widget.container_area, coord_system="y-up")
         self.nav_gizmo.snap_requested.connect(self._on_vispy_nav_gizmo_snap)
         self.nav_gizmo.update_from_vispy(self.view.camera.azimuth, self.view.camera.elevation)
         self.nav_gizmo.show()
+
+        # Initialize Orthographic / Perspective Projection Toggle under orientation gizmo
+        self.projection_toggle = CameraProjectionToggleWidget(self.viewer_widget.container_area)
+        self.projection_toggle.projection_changed.connect(self._on_vispy_projection_changed)
+        self.projection_toggle.show()
 
         if hasattr(self.view.camera, 'events') and hasattr(self.view.camera.events, 'transform_change'):
             self.view.camera.events.transform_change.connect(self._on_vispy_camera_transform_changed)
@@ -9429,6 +9438,13 @@ class MainWindow(QMainWindow):
             gy = margin
             self.nav_gizmo.move(max(margin, gx), gy)
             self.nav_gizmo.raise_()
+
+            if hasattr(self, 'projection_toggle') and self.projection_toggle is not None:
+                # Center the projection pill widget directly under the navigation gizmo
+                px = gx + (self.nav_gizmo.width() - self.projection_toggle.width()) // 2
+                py = gy + self.nav_gizmo.height() + 4
+                self.projection_toggle.move(max(margin, px), py)
+                self.projection_toggle.raise_()
         if hasattr(self, 'floating_toolbox') and self.floating_toolbox is not None:
             if self.floating_toolbox.isVisible():
                 max_x = max(0, container_w - self.floating_toolbox.width())
@@ -9456,12 +9472,19 @@ class MainWindow(QMainWindow):
             self.overlay_label.raise_()
 
     def _on_vispy_camera_transform_changed(self, event=None):
-        """Synchronizes the 3D navigation gizmo orientation when the VisPy turntable camera moves."""
+        """Synchronizes the 3D navigation gizmo orientation and projection toggle when the VisPy turntable camera moves."""
         if hasattr(self, 'nav_gizmo') and self.nav_gizmo is not None and hasattr(self, 'view') and self.view.camera is not None:
             try:
                 az = float(getattr(self.view.camera, 'azimuth', 45.0))
                 el = float(getattr(self.view.camera, 'elevation', 30.0))
                 self.nav_gizmo.update_from_vispy(az, el)
+            except Exception:
+                pass
+        if hasattr(self, 'projection_toggle') and self.projection_toggle is not None and hasattr(self, 'view') and self.view.camera is not None:
+            try:
+                fov = getattr(self.view.camera, 'fov', 45.0)
+                is_ortho = (fov == 0.0)
+                self.projection_toggle.set_projection("orthographic" if is_ortho else "perspective", block_signals=True)
             except Exception:
                 pass
 
@@ -9492,6 +9515,27 @@ class MainWindow(QMainWindow):
                     self.canvas.update()
             except Exception as err:
                 print(f"[GIZMO] Error snapping camera: {err}")
+
+    def _on_vispy_projection_changed(self, mode: str):
+        """Handles switching between Perspective and Orthographic projection in the 3D reconstruction viewport."""
+        if not hasattr(self, 'view') or self.view.camera is None:
+            return
+        try:
+            if "ortho" in mode.lower():
+                current_fov = getattr(self.view.camera, 'fov', 45.0)
+                if current_fov > 0.0:
+                    self._last_perspective_fov = current_fov
+                self.view.camera.fov = 0.0
+            else:
+                last_fov = getattr(self, '_last_perspective_fov', 45.0)
+                if not last_fov or last_fov <= 0.0:
+                    last_fov = 45.0
+                self.view.camera.fov = last_fov
+
+            if hasattr(self, 'canvas') and self.canvas:
+                self.canvas.update()
+        except Exception as err:
+            print(f"[CAMERA] Error updating camera projection: {err}")
 
     def _on_show_controls_changed(self, state):
         visible = (state == Qt.Checked.value or state == 2)
