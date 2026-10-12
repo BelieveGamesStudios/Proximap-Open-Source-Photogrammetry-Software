@@ -2853,7 +2853,28 @@ class BackgroundRemovalWorker(QThread):
         try:
             # Set U2NET_HOME to local models directory before importing/initializing rembg
             models_dir = os.path.join(get_base_dir(), "models")
+            if not os.path.isdir(models_dir):
+                alt_models = os.path.join(get_base_dir(), "_internal", "models")
+                if os.path.isdir(alt_models):
+                    models_dir = alt_models
             os.environ["U2NET_HOME"] = models_dir
+
+            # Guard against PyInstaller environments where package metadata for pymatting or rembg is stripped
+            try:
+                import importlib.metadata
+                _orig_metadata_version = importlib.metadata.version
+
+                def _safe_metadata_version(distribution_name):
+                    try:
+                        return _orig_metadata_version(distribution_name)
+                    except (importlib.metadata.PackageNotFoundError, Exception):
+                        if distribution_name in ("pymatting", "rembg"):
+                            return "1.1.12"
+                        raise
+
+                importlib.metadata.version = _safe_metadata_version
+            except Exception:
+                pass
 
             import rembg
             from PIL import Image

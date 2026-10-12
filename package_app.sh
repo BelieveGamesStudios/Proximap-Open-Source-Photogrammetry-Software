@@ -81,7 +81,7 @@ python3 -m PyInstaller --windowed --noconsole $ICON_FLAG --name Proximap \
     --collect-all numpy --collect-all scipy \
     --collect-all vispy --collect-all imgui_bundle \
     --collect-all trimesh --collect-all pyrr --collect-all cv2 \
-    --collect-all rembg --collect-all onnxruntime \
+    --collect-all rembg --collect-all pymatting --copy-metadata pymatting --collect-all onnxruntime \
     --exclude-module PySide6.QtWebEngineCore \
     --exclude-module PySide6.QtWebEngineWidgets \
     --exclude-module PySide6.QtWebEngineQuick \

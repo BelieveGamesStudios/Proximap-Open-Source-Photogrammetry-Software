@@ -13,6 +13,7 @@ open3d
 psutil
 flask
 rembg>=2.0.50
+pymatting>=1.1.12
 onnxruntime
 pyinstaller==6.9.0
 

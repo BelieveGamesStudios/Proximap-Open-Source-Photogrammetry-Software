@@ -83,9 +83,9 @@ $excludes = @(
 )
 
 if ($iconFlag) {
-    python -m PyInstaller --onedir --noconsole $iconFlag --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
+    python -m PyInstaller --onedir --noconsole $iconFlag --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all pymatting --copy-metadata pymatting --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
 } else {
-    python -m PyInstaller --onedir --noconsole --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
+    python -m PyInstaller --onedir --noconsole --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all pymatting --copy-metadata pymatting --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
 }
 
 
