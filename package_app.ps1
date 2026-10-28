@@ -3,6 +3,11 @@
 
 $ErrorActionPreference = "Stop"
 
+python model_assets.py
+if ($LASTEXITCODE -ne 0) {
+    throw "Offline model validation failed; restore the model before packaging."
+}
+
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host " Starting Proximap Commercial Packaging" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -26,6 +31,32 @@ if (Test-Path "app_icon.png") {
         Write-Host "  Successfully converted app_icon.png to app_icon.ico" -ForegroundColor Green
     } else {
         Write-Warning "Failed to convert app_icon.png to app_icon.ico"
+    }
+}
+
+# 1.6 Extract PyMeshLab Windows wheel & download standalone Python 3.10 interpreter
+Write-Host "Setting up PyMeshLab and standalone Python 3.10 runtime for Windows..." -ForegroundColor Yellow
+if (Test-Path "backend_bin/PymeshLab") {
+    $winWhl = Get-ChildItem -Path "backend_bin/PymeshLab/*win_amd64.whl" | Select-Object -First 1
+    if ($winWhl) {
+        Write-Host "  Extracting Windows wheel: $($winWhl.Name)" -ForegroundColor DarkGray
+        python -c "import zipfile, os; z = zipfile.ZipFile(r'$($winWhl.FullName)'); [z.extract(i, 'backend_bin/pymeshlab_extracted') for i in z.infolist() if i.filename.startswith('pymeshlab/')]"
+    }
+}
+
+$py310Dir = "backend_bin/python3.10"
+$py310Exe = "$py310Dir/python.exe"
+if (-not (Test-Path $py310Exe)) {
+    Write-Host "  Downloading standalone Python 3.10 for Windows (x86_64)..." -ForegroundColor DarkGray
+    $pyUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/20260825/cpython-3.10.21+20260825-x86_64-pc-windows-msvc-shared-install_only_stripped.tar.gz"
+    New-Item -ItemType Directory -Force -Path $py310Dir | Out-Null
+    try {
+        Invoke-WebRequest -Uri $pyUrl -OutFile "$env:TEMP/py310_win.tar.gz"
+        tar -xzf "$env:TEMP/py310_win.tar.gz" --strip-components=1 -C $py310Dir
+        Remove-Item "$env:TEMP/py310_win.tar.gz" -Force
+        Write-Host "  Python 3.10 Windows standalone downloaded and extracted." -ForegroundColor Green
+    } catch {
+        Write-Warning "Could not download standalone Python 3.10 for Windows: $_"
     }
 }
 
@@ -57,9 +88,9 @@ $excludes = @(
 )
 
 if ($iconFlag) {
-    python -m PyInstaller --onedir --noconsole $iconFlag --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --add-data "mesh_editor/shaders;mesh_editor/shaders" $excludes main_window.py
+    python -m PyInstaller --onedir --noconsole $iconFlag --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all pymatting --copy-metadata pymatting --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
 } else {
-    python -m PyInstaller --onedir --noconsole --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --add-data "mesh_editor/shaders;mesh_editor/shaders" $excludes main_window.py
+    python -m PyInstaller --onedir --noconsole --name Proximap --collect-all numpy --collect-all scipy --collect-all vispy --collect-all imgui_bundle --collect-all trimesh --collect-all pyrr --collect-all cv2 --collect-all pymeshlab --collect-all rembg --collect-all pymatting --copy-metadata pymatting --collect-all onnxruntime --add-data "mesh_editor/shaders;mesh_editor/shaders" --add-data "addons;addons" --add-data "models;models" --add-data "interface element;interface element" --add-data "public;public" $excludes main_window.py
 }
 
 
@@ -127,6 +158,16 @@ foreach ($exe in $mvsExes) {
     }
 }
 
+# Copy PyMeshLab and Python 3.10 runtime
+if (Test-Path "backend_bin/pymeshlab_extracted") {
+    Copy-Item -Path "backend_bin/pymeshlab_extracted" -Destination "dist/Proximap/backend_bin/" -Recurse
+    Copy-Item -Path "backend_bin/pymeshlab_extracted" -Destination "dist/Proximap/_internal/backend_bin/" -Recurse
+}
+if (Test-Path "backend_bin/python3.10") {
+    Copy-Item -Path "backend_bin/python3.10" -Destination "dist/Proximap/backend_bin/" -Recurse
+    Copy-Item -Path "backend_bin/python3.10" -Destination "dist/Proximap/_internal/backend_bin/" -Recurse
+}
+
 # Copy toolchain mapping configuration
 Write-Host "  Copying toolchain map configuration..." -ForegroundColor DarkGray
 Copy-Item -Path "toolchain_map.json" -Destination "dist/Proximap/"
@@ -144,6 +185,21 @@ if (Test-Path "public") {
 } else {
     Write-Warning "Public directory not found. UI icons will fail to load."
 }
+
+# Copy interface element directory containing SVG toolbar icons
+Write-Host "  Copying interface element icons..." -ForegroundColor DarkGray
+if (Test-Path "interface element") {
+    Copy-Item -Path "interface element" -Destination "dist/Proximap/interface element" -Recurse
+} else {
+    Write-Warning "interface element directory not found. UI icons will fail to load."
+}
+
+# Copy offline background removal models
+Write-Host "  Copying offline AI models..." -ForegroundColor DarkGray
+if (Test-Path "models") {
+    Copy-Item -Path "models" -Destination "dist/Proximap/models" -Recurse
+}
+
 
 # 5. Compress the finalized distribution folder to ZIP
 Write-Host "[5/5] Compressing distribution into release ZIP..." -ForegroundColor Yellow

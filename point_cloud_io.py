@@ -1,6 +1,6 @@
 """
 Point Cloud I/O Module for Proximap
-Handles loading, saving, and validating point clouds in PLY, LAS/LAZ, and XYZ formats.
+Handles loading, saving, and validating point clouds in PLY format.
 Supports both Open3D and pure NumPy / SciPy fallbacks when Open3D is unavailable.
 """
 
@@ -21,6 +21,57 @@ class LoadResult:
     success: bool = False
 
 
+def get_photogrammetry_flip_matrix() -> np.ndarray:
+    """Returns the 3x3 diagonal matrix F = diag(1, -1, -1) for 180 deg rotation about X axis."""
+    return np.diag([1.0, -1.0, -1.0])
+
+
+def apply_photogrammetry_coordinate_flip(
+    points: Optional[np.ndarray] = None,
+    normals: Optional[np.ndarray] = None,
+    camera_R: Optional[np.ndarray] = None,
+    camera_T: Optional[np.ndarray] = None
+):
+    """
+    Applies the 180 deg X-axis rotation (Y -> -Y, Z -> -Z) to convert OpenCV/COLMAP/OpenMVS
+    coordinate space (Y-down) to standard graphics viewport space (Y-up).
+
+    Transforms:
+      - points: P' = P @ F  (P[:, 1] *= -1, P[:, 2] *= -1)
+      - normals: N' = N @ F (N[:, 1] *= -1, N[:, 2] *= -1)
+      - camera_R: R' = F @ R @ F^T
+      - camera_T: T' = F @ T
+
+    Since F = F^T = F^-1, this function is self-inverting (applying it twice returns to original).
+    """
+    F = get_photogrammetry_flip_matrix()
+
+    ret_points = None
+    if points is not None and len(points) > 0:
+        pts = np.asarray(points).copy()
+        pts[:, 1] *= -1.0
+        pts[:, 2] *= -1.0
+        ret_points = pts
+
+    ret_normals = None
+    if normals is not None and len(normals) > 0:
+        nrm = np.asarray(normals).copy()
+        nrm[:, 1] *= -1.0
+        nrm[:, 2] *= -1.0
+        ret_normals = nrm
+
+    ret_R = None
+    if camera_R is not None:
+        ret_R = F @ camera_R @ F
+
+    ret_T = None
+    if camera_T is not None:
+        ret_T = F @ camera_T
+
+    return ret_points, ret_normals, ret_R, ret_T
+
+
+
 class SimplePointCloud:
     """Lightweight pure-NumPy point cloud representation used when Open3D is not installed."""
     def __init__(self, points: np.ndarray, colors: Optional[np.ndarray] = None, normals: Optional[np.ndarray] = None):
@@ -37,7 +88,7 @@ class SimplePointCloud:
 
 def load_point_cloud(file_path: str, log_fn: Optional[Callable[[str], None]] = None) -> LoadResult:
     """
-    Loads a point cloud from PLY, LAS, LAZ, or XYZ files into an Open3D PointCloud
+    Loads a point cloud from a PLY file into an Open3D PointCloud
     or SimplePointCloud object.
     """
     def log(msg: str):
@@ -48,19 +99,16 @@ def load_point_cloud(file_path: str, log_fn: Optional[Callable[[str], None]] = N
         return LoadResult(cloud=None, warnings=[f"File not found: {file_path}"], success=False)
 
     ext = os.path.splitext(file_path)[1].lower()
+    if ext != '.ply':
+        return LoadResult(cloud=None, warnings=[f"Unsupported point cloud format '{ext}'. Only .ply format is supported."], success=False)
+
     log(f"[REF_CLOUD] Loading point cloud: {os.path.basename(file_path)} ({ext})")
     warnings = []
 
     # 1. Try Open3D if available
     try:
         import open3d as o3d
-        cloud = o3d.geometry.PointCloud()
-        if ext in ['.las', '.laz']:
-            cloud = _load_las_laz_o3d(file_path, warnings, log)
-        elif ext in ['.ply', '.xyz', '.pts', '.txt']:
-            cloud = o3d.io.read_point_cloud(file_path)
-            if len(cloud.points) == 0 and ext in ['.xyz', '.pts', '.txt']:
-                cloud = _load_xyz_numpy(file_path, warnings, log)
+        cloud = o3d.io.read_point_cloud(file_path)
         
         if cloud is not None and len(cloud.points) > 0:
             cloud = cloud.remove_non_finite_points(remove_nan=True, remove_infinite=True)
@@ -121,40 +169,26 @@ def load_point_cloud(file_path: str, log_fn: Optional[Callable[[str], None]] = N
 
 def peek_has_colors(file_path: str) -> bool:
     """
-    Quickly checks whether a point cloud file contains vertex color data
+    Quickly checks whether a PLY point cloud file contains vertex color data
     by reading only the file header — NOT loading the full point cloud.
     """
     ext = os.path.splitext(file_path)[1].lower()
+    if ext != '.ply':
+        return False
     try:
-        if ext == '.ply':
-            with open(file_path, 'rb') as f:
-                header = b''
-                while len(header) < 4096:
-                    line = f.readline()
-                    if not line: break
-                    header += line
-                    if b'end_header' in line: break
-            header_str = header.decode('utf-8', errors='ignore').lower()
-            return any(
-                f'property {dtype} {ch}' in header_str
-                for dtype in ('uchar', 'uint8', 'float', 'float32')
-                for ch in ('red', 'green', 'blue', 'r', 'g', 'b')
-            )
-        elif ext in ('.las', '.laz'):
-            try:
-                import laspy
-                las = laspy.read(file_path)
-                fmt_id = int(getattr(las.header.point_format, 'id', 0))
-                return fmt_id in (2, 3, 5, 7, 8, 10)
-            except Exception:
-                return True
-        else:
-            with open(file_path, 'r', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        return len(line.split()) >= 6
-            return False
+        with open(file_path, 'rb') as f:
+            header = b''
+            while len(header) < 4096:
+                line = f.readline()
+                if not line: break
+                header += line
+                if b'end_header' in line: break
+        header_str = header.decode('utf-8', errors='ignore').lower()
+        return any(
+            f'property {dtype} {ch}' in header_str
+            for dtype in ('uchar', 'uint8', 'float', 'float32')
+            for ch in ('red', 'green', 'blue', 'r', 'g', 'b')
+        )
     except Exception:
         return True
 
@@ -163,36 +197,6 @@ def _load_numpy_fallback(file_path: str, warnings: List[str], log: Callable[[str
     ext = os.path.splitext(file_path)[1].lower()
     if ext == '.ply':
         pts, colors, _ = _read_ply_pure_numpy(file_path)
-        return SimplePointCloud(pts, colors)
-    elif ext in ('.las', '.laz'):
-        try:
-            import laspy
-            las = laspy.read(file_path)
-            pts = np.vstack((las.x, las.y, las.z)).transpose().astype(np.float32)
-            colors = None
-            if hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue'):
-                r = np.asarray(las.red, dtype=np.float32)
-                g = np.asarray(las.green, dtype=np.float32)
-                b = np.asarray(las.blue, dtype=np.float32)
-                max_val = max(np.max(r), np.max(g), np.max(b))
-                scale = 255.0 if max_val <= 255.0 else 65535.0
-                colors = (np.vstack((r, g, b)).T / scale * 255.0).astype(np.uint8)
-            return SimplePointCloud(pts, colors)
-        except Exception as e:
-            warnings.append(f"laspy error: {e}")
-            return None
-    elif ext in ('.xyz', '.pts', '.txt'):
-        data = np.loadtxt(file_path)
-        if data.ndim == 1:
-            data = data.reshape(1, -1)
-        if data.shape[1] < 3:
-            raise ValueError("XYZ file must have at least 3 columns (X, Y, Z)")
-        pts = data[:, :3].astype(np.float32)
-        colors = None
-        if data.shape[1] >= 6:
-            c = data[:, 3:6]
-            if np.max(c) <= 1.0: c *= 255.0
-            colors = c.astype(np.uint8)
         return SimplePointCloud(pts, colors)
     return None
 
@@ -225,6 +229,12 @@ def _read_ply_pure_numpy(path: str):
                 else:
                     vertex_properties.append((parts[2], parts[1], False, None, None))
 
+        type_map = {
+            'char': (np.int8, 1), 'uchar': (np.uint8, 1), 'short': (np.int16, 2), 'ushort': (np.uint16, 2),
+            'int': (np.int32, 4), 'uint': (np.uint32, 4), 'float': (np.float32, 4), 'double': (np.float64, 8),
+            'int8': (np.int8, 1), 'uint8': (np.uint8, 1), 'int16': (np.int16, 2), 'uint16': (np.uint16, 2),
+            'int32': (np.int32, 4), 'uint32': (np.uint32, 4), 'float32': (np.float32, 4), 'float64': (np.float64, 8)
+        }
         type_char_map = {
             'char': 'b', 'uchar': 'B', 'short': 'h', 'ushort': 'H',
             'int': 'i', 'uint': 'I', 'float': 'f', 'double': 'd',
@@ -324,37 +334,63 @@ def _read_ply_pure_numpy(path: str):
     return points, colors, None
 
 
-def _load_las_laz_o3d(file_path: str, warnings: List[str], log: Callable[[str], None]):
-    import open3d as o3d
-    import laspy
-    las = laspy.read(file_path)
-    coords = np.vstack((las.x, las.y, las.z)).transpose().astype(np.float64)
-    cloud = o3d.geometry.PointCloud()
-    cloud.points = o3d.utility.Vector3dVector(coords)
-    if hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue'):
-        r = np.asarray(las.red, dtype=np.float64)
-        g = np.asarray(las.green, dtype=np.float64)
-        b = np.asarray(las.blue, dtype=np.float64)
-        max_val = max(np.max(r), np.max(g), np.max(b))
-        scale = 65535.0 if max_val > 255.0 else 255.0
-        if scale > 0:
-            colors = np.vstack((r / scale, g / scale, b / scale)).transpose()
-            cloud.colors = o3d.utility.Vector3dVector(colors)
-    return cloud
+def write_ply_binary(file_path: str, points: np.ndarray, colors: Optional[np.ndarray] = None, normals: Optional[np.ndarray] = None) -> bool:
+    """Writes a point cloud to binary PLY format (fast and compact)."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        pts = np.asarray(points, dtype=np.float32)
+        num_verts = len(pts)
+        has_colors = colors is not None and len(colors) == num_verts
+        has_normals = normals is not None and len(normals) == num_verts
+        
+        header = ["ply", "format binary_little_endian 1.0", f"element vertex {num_verts}"]
+        header.extend(["property float x", "property float y", "property float z"])
+        if has_normals:
+            header.extend(["property float nx", "property float ny", "property float nz"])
+        if has_colors:
+            header.extend(["property uchar red", "property uchar green", "property uchar blue"])
+        header.append("end_header\n")
+        header_bytes = "\n".join(header).encode("ascii")
+        
+        dtype_fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+        if has_normals:
+            dtype_fields.extend([("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4")])
+        if has_colors:
+            dtype_fields.extend([("red", "u1"), ("green", "u1"), ("blue", "u1")])
+        
+        structured_arr = np.empty(num_verts, dtype=dtype_fields)
+        structured_arr["x"] = pts[:, 0]
+        structured_arr["y"] = pts[:, 1]
+        structured_arr["z"] = pts[:, 2]
+        if has_normals:
+            nrm = np.asarray(normals, dtype=np.float32)
+            structured_arr["nx"] = nrm[:, 0]
+            structured_arr["ny"] = nrm[:, 1]
+            structured_arr["nz"] = nrm[:, 2]
+        if has_colors:
+            cols = np.asarray(colors)
+            if cols.dtype != np.uint8:
+                cols = (np.clip(cols, 0.0, 1.0) * 255.0).astype(np.uint8)
+            structured_arr["red"] = cols[:, 0]
+            structured_arr["green"] = cols[:, 1]
+            structured_arr["blue"] = cols[:, 2]
+            
+        with open(file_path, "wb") as f:
+            f.write(header_bytes)
+            structured_arr.tofile(f)
+        return True
+    except Exception as e:
+        print(f"[ERROR] write_ply_binary failed: {e}")
+        return False
 
 
-def _load_xyz_numpy(file_path: str, warnings: List[str], log: Callable[[str], None]):
-    import open3d as o3d
-    data = np.loadtxt(file_path)
-    if data.ndim == 1: data = data.reshape(1, -1)
-    if data.shape[1] < 3: raise ValueError("XYZ file must have at least 3 columns")
-    cloud = o3d.geometry.PointCloud()
-    cloud.points = o3d.utility.Vector3dVector(data[:, :3].astype(np.float64))
-    if data.shape[1] >= 6:
-        colors = data[:, 3:6].astype(np.float64)
-        if np.max(colors) > 1.0: colors /= 255.0
-        cloud.colors = o3d.utility.Vector3dVector(colors)
-    return cloud
+def save_transformed_point_cloud(file_path: str, viewport_points: np.ndarray, colors: Optional[np.ndarray] = None, normals: Optional[np.ndarray] = None) -> bool:
+    """
+    Saves viewport point cloud to PLY file, applying photogrammetry coordinate conversion
+    so that reloading or running reconstruction uses the exact oriented coordinates.
+    """
+    pts_file, nrm_file, _, _ = apply_photogrammetry_coordinate_flip(points=viewport_points, normals=normals)
+    return write_ply_binary(file_path, pts_file, colors=colors, normals=nrm_file)
 
 
 def save_point_cloud(cloud, file_path: str) -> bool:
@@ -370,17 +406,6 @@ def save_point_cloud(cloud, file_path: str) -> bool:
     if hasattr(cloud, 'points'):
         pts = np.asarray(cloud.points)
         cols = np.asarray(cloud.colors) if hasattr(cloud, 'colors') and cloud.colors is not None else None
-        with open(file_path, 'w') as f:
-            f.write("ply\nformat ascii 1.0\n")
-            f.write(f"element vertex {len(pts)}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            if cols is not None and len(cols) == len(pts):
-                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-            f.write("end_header\n")
-            for i in range(len(pts)):
-                if cols is not None and len(cols) == len(pts):
-                    f.write(f"{pts[i][0]:.6f} {pts[i][1]:.6f} {pts[i][2]:.6f} {int(cols[i][0])} {int(cols[i][1])} {int(cols[i][2])}\n")
-                else:
-                    f.write(f"{pts[i][0]:.6f} {pts[i][1]:.6f} {pts[i][2]:.6f}\n")
-        return True
+        nrms = np.asarray(cloud.normals) if hasattr(cloud, 'normals') and cloud.normals is not None else None
+        return write_ply_binary(file_path, pts, colors=cols, normals=nrms)
     return False

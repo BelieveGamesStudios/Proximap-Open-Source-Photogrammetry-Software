@@ -4,6 +4,8 @@
 
 set -e
 
+python3 model_assets.py
+
 echo "============================================="
 echo " Starting Proximap Commercial Packaging (macOS)"
 echo "============================================="
@@ -12,6 +14,43 @@ echo "============================================="
 echo "[1/5] Cleaning up old build/dist files and logs..."
 rm -rf build dist *.log
 echo "  Cleaned up old files."
+
+# 1b. Extract PyMeshLab macOS wheel & download standalone Python 3.10 interpreter
+echo "[1b/5] Setting up PyMeshLab and standalone Python 3.10 runtime for macOS..."
+if [ -d "backend_bin/PymeshLab" ]; then
+    python3 - << 'PYEOF'
+import os, zipfile, glob, stat
+
+out_dir = "backend_bin/pymeshlab_extracted"
+os.makedirs(out_dir, exist_ok=True)
+whl_candidates = glob.glob("backend_bin/PymeshLab/*macosx*.whl")
+if whl_candidates:
+    target_whl = whl_candidates[0]
+    print(f"  Extracting macOS wheel: {target_whl}")
+    with zipfile.ZipFile(target_whl, 'r') as z:
+        for info in z.infolist():
+            if info.filename.startswith("pymeshlab/"):
+                z.extract(info, out_dir)
+                target = os.path.join(out_dir, info.filename)
+                if target.endswith(".so") or target.endswith(".dylib"):
+                    os.chmod(target, os.stat(target).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+print("  PyMeshLab macOS wheel extraction complete.")
+PYEOF
+fi
+
+PY310_DIR="backend_bin/python3.10"
+PY310_BIN="$PY310_DIR/bin/python3.10"
+if [ ! -f "$PY310_BIN" ]; then
+    echo "  Downloading standalone Python 3.10 for macOS (aarch64)..."
+    PY310_TARBALL="cpython-3.10.21+20260825-aarch64-apple-darwin-install_only_stripped.tar.gz"
+    PY310_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260825/${PY310_TARBALL}"
+    mkdir -p "$PY310_DIR"
+    if curl -L --retry 3 --retry-delay 5 -o "/tmp/${PY310_TARBALL}" "$PY310_URL" 2>/dev/null; then
+        tar -xzf "/tmp/${PY310_TARBALL}" --strip-components=1 -C "$PY310_DIR"
+        rm -f "/tmp/${PY310_TARBALL}"
+        echo "  Python 3.10 macOS standalone downloaded and extracted."
+    fi
+fi
 
 # 2. Run PyInstaller to package the Python GUI
 echo "[2/5] Compiling Python application using PyInstaller..."
@@ -44,7 +83,7 @@ python3 -m PyInstaller --windowed --noconsole $ICON_FLAG --name Proximap \
     --collect-all numpy --collect-all scipy \
     --collect-all vispy --collect-all imgui_bundle \
     --collect-all trimesh --collect-all pyrr --collect-all cv2 \
-    --collect-all pymeshlab \
+    --collect-all rembg --collect-all pymatting --copy-metadata pymatting --collect-all onnxruntime \
     --exclude-module PySide6.QtWebEngineCore \
     --exclude-module PySide6.QtWebEngineWidgets \
     --exclude-module PySide6.QtWebEngineQuick \
@@ -62,7 +101,12 @@ python3 -m PyInstaller --windowed --noconsole $ICON_FLAG --name Proximap \
     --exclude-module PySide6.QtSql \
     --exclude-module PySide6.QtXml \
     --exclude-module matplotlib \
-    --add-data "mesh_editor/shaders:mesh_editor/shaders" main_window.py
+    --add-data "mesh_editor/shaders:mesh_editor/shaders" \
+    --add-data "addons:addons" \
+    --add-data "models:models" \
+    --add-data "interface element:interface element" \
+    --add-data "public:public" \
+    --add-data "pymeshlab_worker.py:." main_window.py
 
 if [ ! -d "dist/Proximap.app" ]; then
     echo "PyInstaller compilation failed! 'dist/Proximap.app' not found."
@@ -80,9 +124,22 @@ PYMESHLAB_DIR="$MAC_OS_DIR/backend_bin/PymeshLab"
 mkdir -p "$COLMAP_DIR"
 mkdir -p "$OPENMVS_DIR"
 mkdir -p "$PYMESHLAB_DIR"
+mkdir -p "$MAC_OS_DIR/_internal/backend_bin"
 
 if [ -d "backend_bin/PymeshLab" ]; then
     cp -r backend_bin/PymeshLab/* "$PYMESHLAB_DIR/" 2>/dev/null || true
+fi
+
+if [ -d "backend_bin/pymeshlab_extracted" ]; then
+    cp -r backend_bin/pymeshlab_extracted "$MAC_OS_DIR/backend_bin/" 2>/dev/null || true
+    cp -r backend_bin/pymeshlab_extracted "$MAC_OS_DIR/_internal/backend_bin/" 2>/dev/null || true
+fi
+
+if [ -d "$PY310_DIR" ] && [ -f "$PY310_BIN" ]; then
+    cp -r "$PY310_DIR" "$MAC_OS_DIR/backend_bin/" 2>/dev/null || true
+    cp -r "$PY310_DIR" "$MAC_OS_DIR/_internal/backend_bin/" 2>/dev/null || true
+    chmod -R 755 "$MAC_OS_DIR/backend_bin/python3.10" 2>/dev/null || true
+    chmod -R 755 "$MAC_OS_DIR/_internal/backend_bin/python3.10" 2>/dev/null || true
 fi
 
 # 4. Copy backend binaries selectively
@@ -138,6 +195,19 @@ if [ -d "public" ]; then
 else
     echo "  [WARNING] Public directory not found."
 fi
+
+echo "  Copying interface element icons..."
+if [ -d "interface element" ]; then
+    cp -r "interface element" "$MAC_OS_DIR/"
+else
+    echo "  [WARNING] interface element directory not found."
+fi
+
+echo "  Copying offline AI models..."
+if [ -d "models" ]; then
+    cp -r "models" "$MAC_OS_DIR/"
+fi
+
 
 # Fix permissions
 chmod -R 755 "$MAC_OS_DIR/backend_bin"

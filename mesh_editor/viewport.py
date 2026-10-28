@@ -4,7 +4,7 @@ import time
 import numpy as np
 import pyrr
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtCore import Qt, Signal, QPoint, QRectF
+from PySide6.QtCore import Qt, Signal, QPoint, QRectF, QTimer
 from PySide6.QtGui import QMouseEvent, QKeyEvent, QWheelEvent, QAction, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
 
 import OpenGL.GL as gl
@@ -74,10 +74,25 @@ class MeshEditorViewport(QOpenGLWidget):
         self.is_panning = False
         self.is_zooming = False
         
+        # Unity-style Flythrough & Arrow Navigation states
+        self.is_fly_navigating = False
+        self._active_nav_keys = set()
+        self.fly_base_speed = 8.0   # units / sec
+        self.fly_sprint_mult = 3.0  # Shift sprint speed multiplier
+        self._last_nav_time = time.time()
+        self._nav_timer = QTimer(self)
+        self._nav_timer.setInterval(16)  # ~60 FPS
+        self._nav_timer.timeout.connect(self._on_nav_timer_tick)
+        
         # GPU buffers & shader programs
         self.object_program = None
         self.grid_program = None
-        
+        self._pick_program = None   # flat-color ID shader used for GPU picking
+        self._pick_fbo = None       # off-screen framebuffer for color-ID picking
+        self._pick_rbo_color = None # renderbuffer: RGBA color attachment
+        self._pick_rbo_depth = None # renderbuffer: depth attachment
+        self._pick_fbo_size = (0, 0)  # tracks last allocated FBO size
+
         # Grid quad VAO
         self.grid_vao = None
         self.grid_vbo = None
@@ -127,6 +142,63 @@ class MeshEditorViewport(QOpenGLWidget):
             self.nav_gizmo.update_orientation(self.camera.yaw, self.camera.pitch)
         self.camera_changed.emit(self.camera)
 
+    def _on_nav_timer_tick(self):
+        now = time.time()
+        dt = min(now - self._last_nav_time, 0.1)
+        self._last_nav_time = now
+        
+        # If no keys are held and not currently holding RMB, stop timer
+        if not self._active_nav_keys:
+            if not self.is_fly_navigating:
+                self._nav_timer.stop()
+            return
+            
+        speed_mult = self.fly_sprint_mult if (Qt.Key.Key_Shift in self._active_nav_keys) else 1.0
+        
+        move_vec = np.zeros(3, dtype=np.float32)
+        fwd = self.camera.get_forward_vector()
+        right = self.camera.get_right_vector()
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        
+        # Arrow keys navigation (Always active)
+        if Qt.Key.Key_Up in self._active_nav_keys:
+            move_vec += fwd
+        if Qt.Key.Key_Down in self._active_nav_keys:
+            move_vec -= fwd
+        if Qt.Key.Key_Right in self._active_nav_keys:
+            move_vec += right
+        if Qt.Key.Key_Left in self._active_nav_keys:
+            move_vec -= right
+            
+        # WASD / QE navigation (Active during RMB Fly Navigation)
+        if self.is_fly_navigating:
+            if Qt.Key.Key_W in self._active_nav_keys:
+                move_vec += fwd
+            if Qt.Key.Key_S in self._active_nav_keys:
+                move_vec -= fwd
+            if Qt.Key.Key_D in self._active_nav_keys:
+                move_vec += right
+            if Qt.Key.Key_A in self._active_nav_keys:
+                move_vec -= right
+            if Qt.Key.Key_E in self._active_nav_keys or Qt.Key.Key_PageUp in self._active_nav_keys:
+                move_vec += up
+            if Qt.Key.Key_Q in self._active_nav_keys or Qt.Key.Key_PageDown in self._active_nav_keys:
+                move_vec -= up
+                
+        if np.linalg.norm(move_vec) > 1e-5:
+            move_dir = move_vec / np.linalg.norm(move_vec)
+            displacement = move_dir * (self.fly_base_speed * speed_mult * dt)
+            self.camera.move(displacement)
+            self.notify_camera_changed()
+            self.update()
+
+    def focusOutEvent(self, event):
+        self._active_nav_keys.clear()
+        self.is_fly_navigating = False
+        if hasattr(self, '_nav_timer') and self._nav_timer.isActive():
+            self._nav_timer.stop()
+        super().focusOutEvent(event)
+
     def initializeGL(self):
         # Initialize OpenGL context
         print(f"[VP] initializeGL widget size=({self.width()},{self.height()})")
@@ -163,10 +235,198 @@ class MeshEditorViewport(QOpenGLWidget):
         
         # Scene starts empty on startup. Primitives/meshes can be imported using the Import button.
         pass
-        
+
+        # Build the minimal flat-color shader used for GPU color-ID picking
+        self._build_pick_program()
+
         # Enable depth testing
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDepthFunc(gl.GL_LEQUAL)
+
+    # -----------------------------------------------------------------------
+    # GPU Color-ID Picking
+    # -----------------------------------------------------------------------
+    def _build_pick_program(self):
+        """Compile a minimal flat-colour shader used only for picking."""
+        vert_src = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 proj;
+void main() {
+    gl_Position = proj * view * model * vec4(aPos, 1.0);
+}
+"""
+        frag_src = """
+#version 330 core
+uniform vec4 pickColor;
+out vec4 fragColor;
+void main() { fragColor = pickColor; }
+"""
+        def _compile(src, kind):
+            s = gl.glCreateShader(kind)
+            gl.glShaderSource(s, src)
+            gl.glCompileShader(s)
+            if not gl.glGetShaderiv(s, gl.GL_COMPILE_STATUS):
+                print(f"[PICK] Shader compile error: {gl.glGetShaderInfoLog(s)}")
+            return s
+
+        vs = _compile(vert_src, gl.GL_VERTEX_SHADER)
+        fs = _compile(frag_src, gl.GL_FRAGMENT_SHADER)
+        prog = gl.glCreateProgram()
+        gl.glAttachShader(prog, vs)
+        gl.glAttachShader(prog, fs)
+        gl.glLinkProgram(prog)
+        gl.glDeleteShader(vs)
+        gl.glDeleteShader(fs)
+        self._pick_program = prog
+
+    def _ensure_pick_fbo(self, w: int, h: int):
+        """Create or resize the off-screen FBO used for color-ID picking."""
+        if self._pick_fbo is not None and self._pick_fbo_size == (w, h):
+            return  # already the right size
+
+        # Delete old resources
+        if self._pick_fbo is not None:
+            gl.glDeleteFramebuffers(1, [self._pick_fbo])
+            gl.glDeleteRenderbuffers(1, [self._pick_rbo_color])
+            gl.glDeleteRenderbuffers(1, [self._pick_rbo_depth])
+
+        self._pick_fbo = gl.glGenFramebuffers(1)
+        self._pick_rbo_color = gl.glGenRenderbuffers(1)
+        self._pick_rbo_depth = gl.glGenRenderbuffers(1)
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._pick_fbo)
+
+        gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, self._pick_rbo_color)
+        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_RGBA8, w, h)
+        gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0,
+                                     gl.GL_RENDERBUFFER, self._pick_rbo_color)
+
+        gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, self._pick_rbo_depth)
+        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, w, h)
+        gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT,
+                                     gl.GL_RENDERBUFFER, self._pick_rbo_depth)
+
+        status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+        if status != gl.GL_FRAMEBUFFER_COMPLETE:
+            print(f"[PICK] FBO incomplete: {status}")
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        self._pick_fbo_size = (w, h)
+
+    @staticmethod
+    def _id_to_color(obj_id: int):
+        """Encode a 1-based object index into a normalised RGBA colour."""
+        r = ((obj_id >>  0) & 0xFF) / 255.0
+        g = ((obj_id >>  8) & 0xFF) / 255.0
+        b = ((obj_id >> 16) & 0xFF) / 255.0
+        return (r, g, b, 1.0)
+
+    @staticmethod
+    def _color_to_id(r: int, g: int, b: int) -> int:
+        """Decode an RGB pixel (0-255 each) back to a 1-based object index."""
+        return r | (g << 8) | (b << 16)
+
+    def _pick_object_at(self, mouse_x: float, mouse_y: float, shift_held: bool):
+        """
+        GPU color-ID picking.
+        Renders every scene object as a solid unique colour into an off-screen
+        FBO, reads the single pixel under the mouse, and maps it back to the
+        clicked object. Pixel-perfect regardless of mesh size or DPI scale.
+        """
+        if not self.scene.objects or self._pick_program is None:
+            return None
+
+        self.makeCurrent()  # ensure correct GL context
+
+        # Use physical framebuffer dimensions for the FBO (matches glViewport)
+        w = getattr(self, '_fb_width', self.width())
+        h = getattr(self, '_fb_height', self.height())
+
+        self._ensure_pick_fbo(w, h)
+
+        # ------------------------------------------------------------------
+        # Render ID pass into the off-screen FBO
+        # ------------------------------------------------------------------
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._pick_fbo)
+        gl.glViewport(0, 0, w, h)
+        gl.glClearColor(0.0, 0.0, 0.0, 0.0)   # ID 0 = no object
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glDepthFunc(gl.GL_LEQUAL)
+        gl.glDisable(gl.GL_BLEND)
+
+        # Use physical aspect ratio so the projection exactly matches rendering
+        aspect = w / max(h, 1)
+        view_matrix = self.camera.get_view_matrix()
+        proj_matrix = self.camera.get_projection_matrix(aspect)
+
+        gl.glUseProgram(self._pick_program)
+        gl.glUniformMatrix4fv(
+            gl.glGetUniformLocation(self._pick_program, "view"), 1, gl.GL_FALSE, view_matrix)
+        gl.glUniformMatrix4fv(
+            gl.glGetUniformLocation(self._pick_program, "proj"), 1, gl.GL_FALSE, proj_matrix)
+
+        loc_model = gl.glGetUniformLocation(self._pick_program, "model")
+        loc_color = gl.glGetUniformLocation(self._pick_program, "pickColor")
+
+        for idx, obj in enumerate(self.scene.objects, start=1):
+            r, g, b, a = self._id_to_color(idx)
+            gl.glUniform4f(loc_color, r, g, b, a)
+            gl.glUniformMatrix4fv(loc_model, 1, gl.GL_FALSE, obj.get_model_matrix())
+            obj.mesh.draw()
+
+        # ------------------------------------------------------------------
+        # Read back the pixel under the click
+        # ------------------------------------------------------------------
+        # mouse_x / mouse_y are logical pixels; convert to physical pixels
+        dpr = self.devicePixelRatioF()
+        px = int(mouse_x * dpr)
+        # OpenGL Y is bottom-up; Qt Y is top-down
+        py = int(h - 1 - mouse_y * dpr)
+        px = max(0, min(px, w - 1))
+        py = max(0, min(py, h - 1))
+
+        pixel = gl.glReadPixels(px, py, 1, 1, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE)
+        pr, pg, pb = pixel[0], pixel[1], pixel[2]
+
+        # Restore default framebuffer
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        gl.glViewport(0, 0, w, h)
+
+        # ------------------------------------------------------------------
+        # Decode and update selection
+        # ------------------------------------------------------------------
+        picked_id = self._color_to_id(pr, pg, pb)
+        if picked_id == 0 or picked_id > len(self.scene.objects):
+            hit_obj = None
+        else:
+            hit_obj = self.scene.objects[picked_id - 1]
+
+        if hit_obj is not None:
+            if shift_held:
+                if hit_obj in self.scene.selected_objects:
+                    self.scene.selected_objects.remove(hit_obj)
+                    if self.scene.active_object == hit_obj:
+                        self.scene.active_object = (
+                            self.scene.selected_objects[-1]
+                            if self.scene.selected_objects else None)
+                else:
+                    self.scene.selected_objects.append(hit_obj)
+                    self.scene.active_object = hit_obj
+            else:
+                self.scene.selected_objects = [hit_obj]
+                self.scene.active_object = hit_obj
+        else:
+            if not shift_held:
+                self.scene.selected_objects = []
+                self.scene.active_object = None
+
+        return hit_obj
+
+    # -----------------------------------------------------------------------
 
     def _get_gizmo_pivot(self):
         selected_objs = self.scene.selected_objects
@@ -461,7 +721,18 @@ class MeshEditorViewport(QOpenGLWidget):
                     if self.gizmo.hovered_handle != old_hover:
                         self.update()
                     
-            if self.is_orbiting:
+            if self.is_fly_navigating:
+                # Unity-style Flythrough mouse look (FPS Look)
+                try:
+                    from preferences_dialog import load_preferences
+                    invert = load_preferences().get("invert_mouse_rotation", True)
+                except Exception:
+                    invert = True
+                pitch_mult = 0.003 if invert else -0.003
+                self.camera.fps_look(-dx * 0.003, dy * pitch_mult)
+                self.notify_camera_changed()
+                self.update()
+            elif self.is_orbiting:
                 # Orbiting navigation (Middle click drag or Alt + LMB drag)
                 try:
                     from preferences_dialog import load_preferences
@@ -523,7 +794,16 @@ class MeshEditorViewport(QOpenGLWidget):
                     super().mousePressEvent(event)
                     return
         
-        # 2. Handle viewport cameras or selection if not captured
+        # 2. Handle Right-Click Flythrough Navigation
+        if event.button() == Qt.MouseButton.RightButton:
+            self.is_fly_navigating = True
+            self._last_nav_time = time.time()
+            if not self._nav_timer.isActive():
+                self._nav_timer.start()
+            super().mousePressEvent(event)
+            return
+
+        # 3. Handle viewport cameras or selection if not captured
         # Check for Alt modifier for trackpad navigation fallbacks
         if event.modifiers() & Qt.KeyboardModifier.AltModifier and event.button() == Qt.MouseButton.LeftButton:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -539,17 +819,17 @@ class MeshEditorViewport(QOpenGLWidget):
             else:
                 self.is_orbiting = True
         elif event.button() == Qt.MouseButton.LeftButton:
-            # Raycasting selection against objects
+            # GPU color-ID picking (pixel-perfect)
             shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             old_selection = list(self.scene.selected_objects)
-            hit_obj = self.scene.perform_picking(pos.x(), pos.y(), self.width(), self.height(), self.camera, shift_held=shift)
-            
+            hit_obj = self._pick_object_at(pos.x(), pos.y(), shift_held=shift)
+
             if hit_obj is None and not shift:
                 # Clicked empty space: start box selection
                 self._is_box_selecting = True
                 self._box_select_start = pos.toPoint()
                 self._box_select_end = pos.toPoint()
-            
+
             if list(self.scene.selected_objects) != old_selection:
                 self.selection_changed.emit(self.scene.active_object)
             self.update()
@@ -557,6 +837,13 @@ class MeshEditorViewport(QOpenGLWidget):
         super().mousePressEvent(event)
  
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.is_fly_navigating = False
+            _FLY_KEYS = {Qt.Key.Key_W, Qt.Key.Key_A, Qt.Key.Key_S, Qt.Key.Key_D, Qt.Key.Key_Q, Qt.Key.Key_E}
+            self._active_nav_keys.difference_update(_FLY_KEYS)
+            if not self._active_nav_keys:
+                self._nav_timer.stop()
+
         if self._gizmo_dragging:
             self.gizmo.end_drag()
             self._gizmo_dragging = False
@@ -578,16 +865,25 @@ class MeshEditorViewport(QOpenGLWidget):
             
         if self._is_box_selecting:
             self._is_box_selecting = False
-            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-            old_selection = list(self.scene.selected_objects)
-            self.scene.perform_box_picking(
-                self._box_select_start.x(), self._box_select_start.y(),
-                self._box_select_end.x(), self._box_select_end.y(),
-                self.width(), self.height(), self.camera, shift_held=shift
-            )
-            if list(self.scene.selected_objects) != old_selection:
-                self.selection_changed.emit(self.scene.active_object)
-            self.update()
+            dx = self._box_select_end.x() - self._box_select_start.x()
+            dy = self._box_select_end.y() - self._box_select_start.y()
+            drag_dist = (dx * dx + dy * dy) ** 0.5
+            # Only fire box selection if the user actually dragged (>= 8 px).
+            # A plain click on empty space is already handled by _pick_object_at
+            # in mousePressEvent and must NOT be re-evaluated here, because the
+            # mesh's large projected AABB would overlap a zero-size drag area
+            # and immediately re-select it.
+            if drag_dist >= 8.0:
+                shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                old_selection = list(self.scene.selected_objects)
+                self.scene.perform_box_picking(
+                    self._box_select_start.x(), self._box_select_start.y(),
+                    self._box_select_end.x(), self._box_select_end.y(),
+                    self.width(), self.height(), self.camera, shift_held=shift
+                )
+                if list(self.scene.selected_objects) != old_selection:
+                    self.selection_changed.emit(self.scene.active_object)
+                self.update()
 
         if event.button() == Qt.MouseButton.MiddleButton or (event.button() == Qt.MouseButton.LeftButton and (self.is_orbiting or self.is_panning or self.is_zooming)):
             self.is_orbiting = False
@@ -599,6 +895,13 @@ class MeshEditorViewport(QOpenGLWidget):
 
     def wheelEvent(self, event: QWheelEvent):
         delta_y = event.angleDelta().y() / 120.0
+        if self.is_fly_navigating:
+            # Adjust fly speed when holding RMB
+            self.fly_base_speed = float(np.clip(self.fly_base_speed * (1.2 ** delta_y), 0.5, 100.0))
+            self.update()
+            event.accept()
+            return
+            
         # Scale zoom speed based on distance
         zoom_speed = self.camera.distance * 0.1 if self.camera.is_perspective else self.camera.ortho_scale * 0.1
         self.camera.zoom(delta_y * zoom_speed)
@@ -610,6 +913,24 @@ class MeshEditorViewport(QOpenGLWidget):
         key = event.key()
         ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
         
+        # Track continuous navigation keys
+        _NAV_KEYS = {
+            Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Left, Qt.Key.Key_Right,
+            Qt.Key.Key_Shift, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown
+        }
+        _FLY_KEYS = {
+            Qt.Key.Key_W, Qt.Key.Key_A, Qt.Key.Key_S, Qt.Key.Key_D,
+            Qt.Key.Key_Q, Qt.Key.Key_E
+        }
+        
+        if key in _NAV_KEYS or (self.is_fly_navigating and key in _FLY_KEYS):
+            self._active_nav_keys.add(key)
+            if not self._nav_timer.isActive():
+                self._last_nav_time = time.time()
+                self._nav_timer.start()
+            event.accept()
+            return
+
         if ctrl and key == Qt.Key.Key_Z:
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                 self.redo_requested.emit()
@@ -695,6 +1016,13 @@ class MeshEditorViewport(QOpenGLWidget):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent):
+        key = event.key()
+        if key in self._active_nav_keys:
+            self._active_nav_keys.discard(key)
+            if not self._active_nav_keys and not self.is_fly_navigating:
+                self._nav_timer.stop()
+            event.accept()
+            return
         super().keyReleaseEvent(event)
 
     # Shaders compile/link helper

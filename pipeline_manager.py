@@ -76,6 +76,19 @@ def get_default_vocab_tree_path() -> str | None:
     return None
 
 
+PIPELINE_STEPS = [
+    "image_preparation",
+    "features_extracted",
+    "features_matched",
+    "sparse_reconstruction",
+    "dense_reconstruction",
+    "mesh_reconstructed",
+    "mesh_refined",
+    "mesh_cleaned",
+    "mesh_textured"
+]
+
+
 class PipelineWorker(QThread):
     """
     Worker thread that executes the photogrammetry toolchain step-by-step.
@@ -86,7 +99,27 @@ class PipelineWorker(QThread):
     log_message = Signal(str)
     finished = Signal(bool, str)
 
-    def __init__(self, image_dir: str, output_dir: str, quality_preset: str = "medium", gpu_mode: str = "auto", has_plain_surfaces: bool = False, auto_cleanup: bool = False, mapper_mode: str = "incremental", ref_cloud_path: str = None, mesh_mode: str = "default", poisson_depth: int = 9, custom_params: dict = None, resume_from_step: str = None, parent=None):
+    def _should_skip(self, target_step: str) -> bool:
+        """Returns True if resume_from_step is set and target_step comes strictly before resume_from_step."""
+        if not self.resume_from_step:
+            return False
+        
+        alias_map = {
+            "images_imported": "features_extracted",
+            "mesh_reconstruction": "mesh_textured"
+        }
+        res_step = alias_map.get(self.resume_from_step, self.resume_from_step)
+        tgt_step = alias_map.get(target_step, target_step)
+
+        if res_step not in PIPELINE_STEPS or tgt_step not in PIPELINE_STEPS:
+            return False
+
+        resume_idx = PIPELINE_STEPS.index(res_step)
+        target_idx = PIPELINE_STEPS.index(tgt_step)
+        return target_idx < resume_idx
+
+
+    def __init__(self, image_dir: str, output_dir: str, quality_preset: str = "medium", gpu_mode: str = "auto", has_plain_surfaces: bool = False, auto_cleanup: bool = False, mapper_mode: str = "incremental", manhattan_align: bool = True, mesh_mode: str = "default", poisson_depth: int = 9, custom_params: dict = None, resume_from_step: str = None, parent=None):
         super().__init__(parent)
         self.image_dir = os.path.abspath(image_dir) if image_dir else image_dir
         self.output_dir = os.path.abspath(output_dir) if output_dir else output_dir
@@ -99,7 +132,9 @@ class PipelineWorker(QThread):
             self.mapper_mode = "global"
         else:
             self.mapper_mode = mapper_mode
-        self.ref_cloud_path = ref_cloud_path
+        self.manhattan_align = manhattan_align
+        if custom_params and "manhattan_align" in custom_params:
+            self.manhattan_align = bool(custom_params["manhattan_align"])
         self.mesh_mode = mesh_mode
         self.poisson_depth = poisson_depth
         self.custom_params = custom_params
@@ -388,13 +423,36 @@ class PipelineWorker(QThread):
         env.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
         return env
 
+    def _get_safe_env(self) -> dict:
+        """
+        Build a sanitized subprocess environment with safe thread count and GPU settings.
+        Used by OpenMVS tools and auxiliary pipeline workers.
+        """
+        env = os.environ.copy()
+        mem_budget = get_memory_budget()
+        num_threads = mem_budget.safe_thread_count
+        env["OMP_NUM_THREADS"] = str(num_threads)
+        if self.gpu_mode == "force_cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        elif self.gpu_mode != "force_gpu":
+            # auto
+            try:
+                parent_has_dgpu = self.parent().dgpu_detected if self.parent() else False
+            except Exception:
+                parent_has_dgpu = False
+            if not parent_has_dgpu:
+                env["CUDA_VISIBLE_DEVICES"] = ""
+        return env
+
     def _run_process_realtime(self, cmd: list, timeout: float, cwd=None, env=None, line_parser=None) -> bool:
         """
         Runs a subprocess and streams its stdout/stderr to the console log in real time.
         Allows users to see step-by-step progress as it occurs.
         Returns True if the process exited with code 0, False otherwise.
         """
+        import queue
         import subprocess
+        import threading
         import glob
         from hardware_profiler import _active_subprocesses
 
@@ -419,6 +477,43 @@ class PipelineWorker(QThread):
         if sys.platform == 'win32':
             creationflags = subprocess.CREATE_NO_WINDOW
 
+        proc = None
+        log_handle = None
+        stdout_thread = None
+        log_pattern = None
+        old_log_state = {}
+        if is_openmvs:
+            log_dir = cwd if cwd else os.getcwd()
+            log_pattern = os.path.join(log_dir, f"{exe_name}-*.log")
+            for path in glob.glob(log_pattern):
+                try:
+                    stat = os.stat(path)
+                    old_log_state[path] = (stat.st_mtime_ns, stat.st_size)
+                except OSError:
+                    pass
+
+        def emit_output(raw_line):
+            clean_line = raw_line.strip()
+            if not clean_line:
+                return False
+            if line_parser:
+                parsed = line_parser(clean_line)
+                self.log_message.emit(parsed if parsed is not None else clean_line)
+            else:
+                self.log_message.emit(clean_line)
+            self.last_output_lines.append(clean_line)
+            return True
+
+        def stop_process():
+            if proc is None or proc.poll() is not None:
+                return
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -434,171 +529,114 @@ class PipelineWorker(QThread):
             start_time = time.time()
             last_mem_check = time.time()
 
-            log_handle = None
+            # Always drain stdout on a separate thread. OpenMVS also writes a log file;
+            # tailing only that file leaves this pipe unread and eventually blocks the
+            # child once the OS pipe buffer fills (most visible during TextureMesh).
+            stdout_lines = queue.Queue()
+
+            def drain_stdout():
+                try:
+                    for output_line in iter(proc.stdout.readline, ""):
+                        stdout_lines.put(output_line)
+                finally:
+                    stdout_lines.put(None)
+
+            stdout_thread = threading.Thread(
+                target=drain_stdout,
+                name=f"{exe_name}-stdout-drain",
+                daemon=True,
+            )
+            stdout_thread.start()
+
             if is_openmvs:
-                # Wait up to 2 seconds for log file to appear in the working directory
-                log_dir = cwd if cwd else os.getcwd()
-                log_pattern = os.path.join(log_dir, f"{exe_name}-*.log")
+                # Wait briefly for the log created by this invocation. Never attach to
+                # a stale log from an earlier run, which otherwise produces endless
+                # heartbeats while hiding the current process diagnostics.
                 for _ in range(20):
                     if not self.is_running:
                         break
-                    log_files = glob.glob(log_pattern)
-                    if log_files:
-                        # Pick the newest matching file
-                        newest_file = max(log_files, key=os.path.getmtime)
+                    if proc.poll() is not None:
+                        break
+                    changed_logs = []
+                    for path in glob.glob(log_pattern):
                         try:
-                            log_handle = open(newest_file, "r", encoding="utf-8", errors="ignore")
-                            break
-                        except Exception:
+                            stat = os.stat(path)
+                            state = (stat.st_mtime_ns, stat.st_size)
+                            if path not in old_log_state or state != old_log_state[path]:
+                                changed_logs.append(path)
+                        except OSError:
                             pass
+                    if changed_logs:
+                        newest_file = max(changed_logs, key=os.path.getmtime)
+                        log_handle = open(newest_file, "r", encoding="utf-8", errors="ignore")
+                        break
                     time.sleep(0.1)
 
-            if log_handle:
-                # Log-tailing loop for OpenMVS
-                last_log_time = time.time()
+            last_output_time = time.time()
+            stdout_done = False
+            while True:
+                if not self.is_running:
+                    stop_process()
+                    return False
+
+                now = time.time()
+                if now - start_time > timeout:
+                    stop_process()
+                    self.log_message.emit(f"[TIMEOUT] Process timed out after {timeout}s")
+                    return False
+
+                if now - last_mem_check > 4.0:
+                    last_mem_check = now
+                    vm = psutil.virtual_memory()
+                    if vm.percent > 96.0 or vm.available < (500 * 1024 * 1024):
+                        stop_process()
+                        self.log_message.emit(
+                            f"[CRITICAL OOM GUARD] System RAM usage reached {vm.percent:.1f}% "
+                            f"({vm.available / (1024**2):.0f} MB available). "
+                            f"Terminated {exe_name} to prevent system lockup/crash."
+                        )
+                        return False
+
+                emitted = False
                 while True:
-                    if not self.is_running:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2.0)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        log_handle.close()
-                        return False
-
-                    if time.time() - start_time > timeout:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2.0)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        log_handle.close()
-                        self.log_message.emit(f"[TIMEOUT] Process timed out after {timeout}s")
-                        return False
-
-                    # Memory watchdog check
-                    if time.time() - last_mem_check > 4.0:
-                        last_mem_check = time.time()
-                        vm = psutil.virtual_memory()
-                        if vm.percent > 96.0 or vm.available < (500 * 1024 * 1024):
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2.0)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                            log_handle.close()
-                            self.log_message.emit(
-                                f"[CRITICAL OOM GUARD] System RAM usage reached {vm.percent:.1f}% "
-                                f"({vm.available / (1024**2):.0f} MB available). "
-                                f"Terminated {exe_name} to prevent system lockup/crash."
-                            )
-                            return False
-
-                    line = log_handle.readline()
-                    if not line:
-                        if proc.poll() is not None:
-                            # Process ended, check one last time for remaining lines
-                            while True:
-                                extra_line = log_handle.readline()
-                                if not extra_line:
-                                    break
-                                clean_line = extra_line.strip()
-                                if clean_line:
-                                    if line_parser:
-                                        parsed = line_parser(clean_line)
-                                        if parsed is not None:
-                                            self.log_message.emit(parsed)
-                                        else:
-                                            self.log_message.emit(clean_line)
-                                    else:
-                                        self.log_message.emit(clean_line)
-                                    self.last_output_lines.append(clean_line)
-                            break
-                        # Emit a heartbeat every 30s of silence so the UI doesn't look frozen
-                        silent_secs = time.time() - last_log_time
-                        if silent_secs >= 30.0:
-                            elapsed = int(time.time() - start_time)
-                            self.log_message.emit(
-                                f"[RUNNING] {exe_name} still processing... ({elapsed}s elapsed, pipeline is active)"
-                            )
-                            last_log_time = time.time()
-                        time.sleep(0.05)
+                    try:
+                        output_line = stdout_lines.get_nowait()
+                    except queue.Empty:
+                        break
+                    if output_line is None:
+                        stdout_done = True
                         continue
+                    emitted = emit_output(output_line) or emitted
 
-                    clean_line = line.strip()
-                    if clean_line:
-                        last_log_time = time.time()  # reset silence timer on real output
-                        if line_parser:
-                            parsed = line_parser(clean_line)
-                            if parsed is not None:
-                                self.log_message.emit(parsed)
-                            else:
-                                self.log_message.emit(clean_line)
-                        else:
-                            self.log_message.emit(clean_line)
-                        self.last_output_lines.append(clean_line)
-                log_handle.close()
-            else:
-                # Standard stdout reading loop for non-OpenMVS tools (or fallback)
-                while True:
-                    if not self.is_running:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2.0)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        return False
-
-                    if time.time() - start_time > timeout:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2.0)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        self.log_message.emit(f"[TIMEOUT] Process timed out after {timeout}s")
-                        return False
-
-                    # Memory watchdog check
-                    if time.time() - last_mem_check > 4.0:
-                        last_mem_check = time.time()
-                        vm = psutil.virtual_memory()
-                        if vm.percent > 96.0 or vm.available < (500 * 1024 * 1024):
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2.0)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                            self.log_message.emit(
-                                f"[CRITICAL OOM GUARD] System RAM usage reached {vm.percent:.1f}% "
-                                f"({vm.available / (1024**2):.0f} MB available). "
-                                f"Terminated {exe_name} to prevent system lockup/crash."
-                            )
-                            return False
-
-                    line = proc.stdout.readline()
-
-                    if not line:
-                        if proc.poll() is not None:
+                if log_handle:
+                    while True:
+                        log_line = log_handle.readline()
+                        if not log_line:
                             break
-                        time.sleep(0.02)
-                        continue
+                        emitted = emit_output(log_line) or emitted
 
-                    clean_line = line.strip()
-                    if clean_line:
-                        if line_parser:
-                            parsed = line_parser(clean_line)
-                            if parsed is not None:
-                                self.log_message.emit(parsed)
-                            else:
-                                self.log_message.emit(clean_line)
-                        else:
-                            self.log_message.emit(clean_line)
-                        self.last_output_lines.append(clean_line)
+                if emitted:
+                    last_output_time = now
+                elif proc.poll() is None and now - last_output_time >= 30.0:
+                    elapsed = int(now - start_time)
+                    self.log_message.emit(
+                        f"[RUNNING] {exe_name} still processing... ({elapsed}s elapsed, pipeline is active)"
+                    )
+                    last_output_time = now
 
-            _active_subprocesses.discard(proc)
+                if proc.poll() is not None and stdout_done:
+                    # One final pass through the OpenMVS log after process exit.
+                    if log_handle:
+                        while emit_output(log_handle.readline()):
+                            pass
+                    break
+
+                time.sleep(0.02)
+
             return proc.returncode == 0
 
         except Exception as e:
+            stop_process()
             self.log_message.emit(f"[ERROR] Failed to run subprocess: {e}")
             if sys.platform != 'win32' and cmd[0].endswith('.exe'):
                 self.log_message.emit(
@@ -607,6 +645,15 @@ class PipelineWorker(QThread):
                     "  are available."
                 )
             return False
+        finally:
+            if log_handle:
+                log_handle.close()
+            if proc is not None:
+                if proc.stdout:
+                    proc.stdout.close()
+                if stdout_thread:
+                    stdout_thread.join(timeout=0.5)
+                _active_subprocesses.discard(proc)
 
     def _run_real_pipeline(self) -> bool:
         """
@@ -621,17 +668,17 @@ class PipelineWorker(QThread):
         is_checkpoint_valid = self._is_valid_checkpoint(check_db_path)
 
         # Clean up stale reconstruction subdirectories to prevent legacy files impacting new scans
-        for subdir in ["colmap", "mvs"]:
-            if subdir == "colmap" and resume_requested and is_checkpoint_valid:
-                self.log_message.emit(f"[RESUME] Preserving valid database checkpoint at: {check_db_path}")
-                continue
-            sub_path = os.path.join(self.output_dir, subdir)
-            if os.path.exists(sub_path):
-                self.log_message.emit(f"[INFO] Cleaning up stale reconstruction directory: {sub_path}")
-                try:
-                    shutil.rmtree(sub_path)
-                except Exception as e:
-                    self.log_message.emit(f"[WARNING] Failed to clean output folder: {e}")
+        if resume_requested:
+            self.log_message.emit(f"[RESUME] Resuming session from step: '{self.resume_from_step}'. Preserving intermediate reconstruction outputs.")
+        else:
+            for subdir in ["colmap", "mvs"]:
+                sub_path = os.path.join(self.output_dir, subdir)
+                if os.path.exists(sub_path):
+                    self.log_message.emit(f"[INFO] Cleaning up stale reconstruction directory: {sub_path}")
+                    try:
+                        shutil.rmtree(sub_path)
+                    except Exception as e:
+                        self.log_message.emit(f"[WARNING] Failed to clean output folder: {e}")
 
         colmap_out = self._to_colmap_path(os.path.abspath(os.path.join(self.output_dir, "colmap")))
         mvs_out = self._to_colmap_path(os.path.abspath(os.path.join(self.output_dir, "mvs")))
@@ -746,6 +793,11 @@ class PipelineWorker(QThread):
         # Override presets with custom parameters if custom overrides checkbox was checked
         if self.custom_params:
             self.log_message.emit("[INFO] Custom parameter overrides enabled. Overriding quality preset configuration.")
+            if "image_max_resolution" in self.custom_params:
+                res_val = self.custom_params["image_max_resolution"]
+                colmap_max_image_size = res_val if res_val > 0 else -1
+                max_image_dim = res_val if res_val > 0 else None
+                self.log_message.emit(f"[INFO] Image Max Resolution set to: {'Unlimited' if res_val <= 0 else f'{res_val}px'}")
             if "guided_matching" in self.custom_params:
                 guided_matching = self.custom_params["guided_matching"]
             if "run_bundle_adjuster" in self.custom_params:
@@ -759,12 +811,14 @@ class PipelineWorker(QThread):
             if "texture_res" in self.custom_params:
                 texture_res = self.custom_params["texture_res"]
 
-        skip_sfm = self.resume_from_step in ["sparse_reconstruction", "dense_reconstruction"]
-        skip_dense = self.resume_from_step == "dense_reconstruction"
+        total_steps = 10 if self.auto_cleanup else 9
 
-        if skip_sfm:
-            self.log_message.emit(f"[RESUME] Resuming session from checkpoint: '{self.resume_from_step}'. Skipping Steps 1-5 (SfM & Sparse Cloud already complete).")
-            self.progress_changed.emit(70)
+        # =========================================================================
+        # STEP 1 — Image Preparation
+        # =========================================================================
+        if self._should_skip("image_preparation"):
+            self.log_message.emit("[RESUME] Skipping Step 1 (Image Preparation already complete).")
+            self.progress_changed.emit(10)
             working_image_dir = os.path.join(self.output_dir, "input_images")
             if not os.path.exists(working_image_dir) or not any(f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')) for f in (os.listdir(working_image_dir) if os.path.exists(working_image_dir) else [])):
                 working_image_dir = self._prepare_images(
@@ -778,10 +832,7 @@ class PipelineWorker(QThread):
             except Exception:
                 self._total_images = 0
         else:
-            # =========================================================================
-            # STEP 1/9 — Image Preparation
-            # =========================================================================
-            self.status_changed.emit("Step 1/9: Preparing Images...")
+            self.status_changed.emit(f"Step 1/{total_steps}: Preparing Images...")
             working_image_dir = self._prepare_images(
                 self.image_dir, self.output_dir, max_image_dim
             )
@@ -792,7 +843,8 @@ class PipelineWorker(QThread):
                 ])
             except Exception:
                 self._total_images = 0
-        self.progress_changed.emit(10)
+            self.progress_changed.emit(10)
+            self._backup_checkpoint("image_preparation")
 
         # Dynamic SIFT parameter throttling based on dataset size, quality preset, and dynamic swap/memory pressure
         colmap_max_num_features, colmap_max_num_matches = self._get_throttled_sift_limits(self._total_images)
@@ -803,7 +855,7 @@ class PipelineWorker(QThread):
         os.makedirs(os.path.dirname(database_path), exist_ok=True)
         working_image_dir = self._to_colmap_path(working_image_dir)
         if os.path.exists(database_path):
-            if resume_requested and is_checkpoint_valid:
+            if resume_requested and (is_checkpoint_valid or self._should_skip("features_extracted")):
                 self.log_message.emit("[RESUME] Preserving valid COLMAP database checkpoint for reconstruction.")
             else:
                 try:
@@ -838,19 +890,92 @@ class PipelineWorker(QThread):
         except Exception as e:
             self.log_message.emit(f"[WARNING] Could not check image dimensions: {e}. Defaulting to single camera model.")
 
-        skip_features_and_matching = resume_requested and is_checkpoint_valid and self.resume_from_step in ["sparse_reconstruction", "dense_reconstruction", "features_matched"]
-        skip_features_only = resume_requested and is_checkpoint_valid and self.resume_from_step == "features_extracted"
-
-        if skip_features_and_matching:
+        # Step 2: Feature Extraction
+        if self._should_skip("features_extracted"):
             self.log_message.emit(
-                "[RESUME] Valid checkpoint database detected! "
-                "Skipping Step 2 (Feature Extraction) and Step 3 (Feature Matching)."
+                "[RESUME] SIFT features already extracted in database! "
+                "Skipping Step 2 (Feature Extraction)."
+            )
+            db_stats = self._query_colmap_database_stats(database_path)
+            if db_stats["feature_counts"]:
+                self._feature_counts = db_stats["feature_counts"]
+            self._emit_feature_summary()
+            self.progress_changed.emit(25)
+        else:
+            self.status_changed.emit(f"Step 2/{total_steps}: Extracting SIFT Features...")
+
+            cmd_extract_gpu = [
+                colmap_exe, "feature_extractor",
+                "--database_path", database_path,
+                "--image_path", working_image_dir,
+                "--ImageReader.camera_model", "PINHOLE",
+                "--ImageReader.single_camera", single_camera_val,
+                "--SiftExtraction.use_gpu", "1",
+                "--SiftExtraction.max_image_size", str(colmap_max_image_size),
+                "--SiftExtraction.num_threads", str(num_threads),
+                "--SiftExtraction.max_num_features", str(colmap_max_num_features),
+                "--SiftExtraction.first_octave", str(colmap_first_octave),
+            ]
+            cmd_extract_cpu = [
+                colmap_exe, "feature_extractor",
+                "--database_path", database_path,
+                "--image_path", working_image_dir,
+                "--ImageReader.camera_model", "PINHOLE",
+                "--ImageReader.single_camera", single_camera_val,
+                "--SiftExtraction.use_gpu", "0",
+                "--SiftExtraction.max_image_size", str(colmap_max_image_size),
+                "--SiftExtraction.num_threads", str(num_threads),
+                "--SiftExtraction.max_num_features", str(colmap_max_num_features),
+                "--SiftExtraction.first_octave", str(colmap_first_octave),
+            ]
+            if self.has_plain_surfaces:
+                additional_flags = [
+                    "--SiftExtraction.peak_threshold", "0.002",
+                    "--SiftExtraction.edge_threshold", "15"
+                ]
+                cmd_extract_gpu.extend(additional_flags)
+                cmd_extract_cpu.extend(additional_flags)
+            self._feature_counts = []
+            if not self._run_with_gpu_fallback(
+                cmd_extract_gpu, cmd_extract_cpu, timeout=14400.0, env=colmap_env,
+                line_parser=self._parse_feature_extraction_line
+            ):
+                return False
+
+            db_stats = self._query_colmap_database_stats(database_path)
+            if db_stats["feature_counts"]:
+                self._feature_counts = db_stats["feature_counts"]
+            self._emit_feature_summary()
+
+            num_registered = db_stats["num_images"]
+            if num_registered < 2:
+                if len(self._feature_counts) >= 2:
+                    num_registered = len(self._feature_counts)
+                elif self._total_images >= 2:
+                    num_registered = self._total_images
+            if num_registered < 2:
+                self.log_message.emit(
+                    f"[ERROR] Only {num_registered} image(s) successfully registered in the database. "
+                    "Reconstruction requires at least 2 registered images. Aborting."
+                )
+                return False
+            elif num_registered < self._total_images:
+                self.log_message.emit(
+                    f"[WARNING] Only {num_registered} out of {self._total_images} images successfully registered. "
+                    "Some images may be skipped or corrupt."
+                )
+
+            self.progress_changed.emit(25)
+            self._backup_checkpoint("features_extracted")
+
+        # Step 3: SIFT matching
+        if self._should_skip("features_matched"):
+            self.log_message.emit(
+                "[RESUME] Feature matches already generated in database! "
+                "Skipping Step 3 (Feature Matching)."
             )
             db_stats = self._query_colmap_database_stats(database_path)
             num_registered = db_stats["num_images"]
-            self.log_message.emit(
-                f"[RESUME] Loaded checkpoint database with {num_registered} registered images and {db_stats['num_pairs']} matched pairs."
-            )
             self._image_names_map = self._get_image_names_from_db(database_path)
             self._pairs_tested = (num_registered * (num_registered - 1)) // 2 if num_registered > 1 else 0
             self._pairs_matched = db_stats["num_pairs"]
@@ -858,91 +983,8 @@ class PipelineWorker(QThread):
                 self._match_counts = db_stats["match_counts"]
             self._emit_matching_summary(database_path)
             self.progress_changed.emit(40)
-
         else:
-            if skip_features_only:
-                self.log_message.emit(
-                    "[RESUME] SIFT features already extracted in database! "
-                    "Skipping Step 2 (Feature Extraction) and proceeding directly to Step 3 (Feature Matching)."
-                )
-                db_stats = self._query_colmap_database_stats(database_path)
-                if db_stats["feature_counts"]:
-                    self._feature_counts = db_stats["feature_counts"]
-                self._emit_feature_summary()
-                self.progress_changed.emit(25)
-            else:
-                # -----------------------------------------------------------------
-                # SIFT path: existing COLMAP feature_extractor + exhaustive_matcher
-                # -----------------------------------------------------------------
-                self.status_changed.emit("Step 2/9: Extracting SIFT Features...")
-
-                cmd_extract_gpu = [
-                    colmap_exe, "feature_extractor",
-                    "--database_path", database_path,
-                    "--image_path", working_image_dir,
-                    "--ImageReader.camera_model", "PINHOLE",
-                    "--ImageReader.single_camera", single_camera_val,
-                    "--SiftExtraction.use_gpu", "1",
-                    "--SiftExtraction.max_image_size", str(colmap_max_image_size),
-                    "--SiftExtraction.num_threads", str(num_threads),
-                    "--SiftExtraction.max_num_features", str(colmap_max_num_features),
-                    "--SiftExtraction.first_octave", str(colmap_first_octave),
-                ]
-                cmd_extract_cpu = [
-                    colmap_exe, "feature_extractor",
-                    "--database_path", database_path,
-                    "--image_path", working_image_dir,
-                    "--ImageReader.camera_model", "PINHOLE",
-                    "--ImageReader.single_camera", single_camera_val,
-                    "--SiftExtraction.use_gpu", "0",
-                    "--SiftExtraction.max_image_size", str(colmap_max_image_size),
-                    "--SiftExtraction.num_threads", str(num_threads),
-                    "--SiftExtraction.max_num_features", str(colmap_max_num_features),
-                    "--SiftExtraction.first_octave", str(colmap_first_octave),
-                ]
-                if self.has_plain_surfaces:
-                    # Preview quality: lower SIFT thresholds as a best-effort fallback
-                    additional_flags = [
-                        "--SiftExtraction.peak_threshold", "0.002",
-                        "--SiftExtraction.edge_threshold", "15"
-                    ]
-                    cmd_extract_gpu.extend(additional_flags)
-                    cmd_extract_cpu.extend(additional_flags)
-                self._feature_counts = []
-                if not self._run_with_gpu_fallback(
-                    cmd_extract_gpu, cmd_extract_cpu, timeout=14400.0, env=colmap_env,
-                    line_parser=self._parse_feature_extraction_line
-                ):
-                    return False
-
-                db_stats = self._query_colmap_database_stats(database_path)
-                if db_stats["feature_counts"]:
-                    self._feature_counts = db_stats["feature_counts"]
-                self._emit_feature_summary()
-
-                num_registered = db_stats["num_images"]
-                if num_registered < 2:
-                    if len(self._feature_counts) >= 2:
-                        num_registered = len(self._feature_counts)
-                    elif self._total_images >= 2:
-                        num_registered = self._total_images
-                if num_registered < 2:
-                    self.log_message.emit(
-                        f"[ERROR] Only {num_registered} image(s) successfully registered in the database. "
-                        "Reconstruction requires at least 2 registered images. Aborting."
-                    )
-                    return False
-                elif num_registered < self._total_images:
-                    self.log_message.emit(
-                        f"[WARNING] Only {num_registered} out of {self._total_images} images successfully registered. "
-                        "Some images may be skipped or corrupt."
-                    )
-
-                self.progress_changed.emit(25)
-                self._backup_checkpoint("features_extracted")
-
-            # Step 3: SIFT matching
-            self.status_changed.emit("Step 3/9: Matching SIFT Features...")
+            self.status_changed.emit(f"Step 3/{total_steps}: Matching SIFT Features...")
             os.makedirs(os.path.dirname(database_path), exist_ok=True)
             if not os.path.exists(database_path):
                 self.log_message.emit(f"[WARNING] COLMAP database missing prior to matching: {database_path}. Initializing database schema...")
@@ -1084,13 +1126,19 @@ class PipelineWorker(QThread):
                 self._match_counts = db_stats["match_counts"]
             self._emit_matching_summary(database_path)
             self.progress_changed.emit(40)
-            self._backup_checkpoint("features_extracted")
+            self._backup_checkpoint("features_matched")
 
 
-        if not skip_sfm:
-            # =========================================================================
-            # STEP 4/9 — Sparse Reconstruction (Mapper)
-            # =========================================================================
+        # =========================================================================
+        # STEP 4/9 — Sparse Reconstruction (Mapper) & STEP 5 — Export to OpenMVS
+        # =========================================================================
+        if self._should_skip("sparse_reconstruction"):
+            self.log_message.emit(
+                "[RESUME] Camera poses and sparse model already reconstructed! "
+                "Skipping Steps 4 & 5 (SfM & OpenMVS Export)."
+            )
+            self.progress_changed.emit(70)
+        else:
             self._triangulated_points = 0
             self._registered_count = 0
             sparse_dir = self._to_colmap_path(os.path.join(colmap_out, "sparse"))
@@ -1120,7 +1168,7 @@ class PipelineWorker(QThread):
             ]
 
             if self.mapper_mode == "global":
-                self.status_changed.emit("Step 4/9: Estimating Camera Poses (GLOMAP Global SfM)...")
+                self.status_changed.emit(f"Step 4/{total_steps}: Estimating Camera Poses (GLOMAP Global SfM)...")
                 self.log_message.emit("[INFO] SfM Mapper: GLOMAP global_mapper selected.")
                 cmd_global = [
                     colmap_exe, "global_mapper",
@@ -1143,7 +1191,7 @@ class PipelineWorker(QThread):
                     if not self._run_process_realtime(cmd_incremental, timeout=14400.0, env=colmap_env, line_parser=self._parse_mapper_line):
                         return False
             else:
-                self.status_changed.emit("Step 4/9: Estimating Camera Poses (SfM)...")
+                self.status_changed.emit(f"Step 4/{total_steps}: Estimating Camera Poses (SfM)...")
                 if not self._run_process_realtime(cmd_incremental, timeout=14400.0, env=colmap_env, line_parser=self._parse_mapper_line):
                     return False
 
@@ -1181,6 +1229,42 @@ class PipelineWorker(QThread):
                 ]
                 self._run_process_realtime(cmd_ba, timeout=600.0, env=colmap_env, line_parser=self._parse_mapper_line)
 
+            # Optional Manhattan World Alignment (Auto-Leveling)
+            if self.manhattan_align:
+                self.status_changed.emit(f"Step 4b/{total_steps}: Aligning Scene Orientation (Manhattan World)...")
+                self.log_message.emit("[INFO] Running COLMAP Manhattan-World model orientation aligner (Auto-Level)...")
+                aligned_model_dir = self._to_colmap_path(os.path.join(sparse_dir, "aligned"))
+                os.makedirs(aligned_model_dir, exist_ok=True)
+                cmd_align = [
+                    colmap_exe, "model_orientation_aligner",
+                    "--image_path", working_image_dir,
+                    "--input_path", target_model_dir,
+                    "--output_path", aligned_model_dir,
+                    "--method", "MANHATTAN-WORLD",
+                    "--max_image_size", "1024"
+                ]
+                align_ok = self._run_process_realtime(cmd_align, timeout=300.0, env=colmap_env)
+                has_aligned_files = False
+                if align_ok and os.path.exists(aligned_model_dir):
+                    aligned_files = os.listdir(aligned_model_dir)
+                    if any(f.startswith("images.") or f.startswith("points3D.") for f in aligned_files):
+                        has_aligned_files = True
+                        for filename in aligned_files:
+                            src_f = os.path.join(aligned_model_dir, filename)
+                            dst_f = os.path.join(target_model_dir, filename)
+                            if os.path.isfile(src_f):
+                                shutil.copy2(src_f, dst_f)
+                        self.log_message.emit("[SUCCESS] Manhattan-World alignment applied. 3D model leveled to coordinate grid.")
+
+                if not has_aligned_files:
+                    self.log_message.emit("[INFO] Manhattan-World alignment skipped (scene vanishing points unconstrained). Keeping default orientation.")
+
+                if os.path.exists(aligned_model_dir):
+                    try:
+                        shutil.rmtree(aligned_model_dir)
+                    except Exception:
+                        pass
+
             # Get reconstruction statistics
             self._last_reconstruction_stats = self._run_model_analyzer(target_model_dir)
             if "images" in self._last_reconstruction_stats:
@@ -1193,10 +1277,8 @@ class PipelineWorker(QThread):
             self._emit_sfm_summary()
             self.progress_changed.emit(60)
 
-            # =========================================================================
-            # STEP 5/9 — Export to OpenMVS Format
-            # =========================================================================
-            self.status_changed.emit("Step 5/9: Exporting Scene to OpenMVS...")
+            # STEP 5 — Export to OpenMVS Format
+            self.status_changed.emit(f"Step 5/{total_steps}: Exporting Scene to OpenMVS...")
 
             # Copy sparse model files to the parent sparse directory so InterfaceCOLMAP can find them
             try:
@@ -1225,11 +1307,11 @@ class PipelineWorker(QThread):
         # =========================================================================
         # STEP 6/9 — Dense Point Cloud Generation
         # =========================================================================
-        if skip_dense:
+        if self._should_skip("dense_reconstruction"):
             self.log_message.emit("[RESUME] Skipping Step 6 (Dense Point Cloud already complete).")
             self.progress_changed.emit(80)
         else:
-            self.status_changed.emit("Step 6/9: Generating Dense Point Cloud...")
+            self.status_changed.emit(f"Step 6/{total_steps}: Generating Dense Point Cloud...")
             mvs_densify_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["DensifyPointCloud"])
 
             sparse_point_count = self._count_scene_points(mvs_out)
@@ -1265,34 +1347,35 @@ class PipelineWorker(QThread):
             self.progress_changed.emit(80)
 
         # =========================================================================
-        # STEP 6b — Optional Reference Point Cloud Alignment & Fusion
-        # =========================================================================
-        fused_mesh_name = self._run_reference_cloud_fusion(mvs_out)
-
-        # =========================================================================
         # STEP 7/9 — Surface Mesh Reconstruction
         # =========================================================================
         if self.mesh_mode == "poisson":
             poisson_ok = self._run_poisson_reconstruction(mvs_out, self.poisson_depth)
             if poisson_ok:
                 self.log_message.emit("[POISSON] Poisson reconstruction completed successfully. Skipping OpenMVS meshing, refinement, and texturing.")
+                self._backup_checkpoint("mesh_reconstructed")
                 self.progress_changed.emit(99)
                 return True
             else:
                 self.log_message.emit("[WARNING] Poisson reconstruction failed. Falling back to default OpenMVS Delaunay meshing pipeline...")
 
-        self.status_changed.emit("Step 7/9: Reconstructing Surface Mesh...")
-        mvs_mesh_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["ReconstructMesh"])
-
         dense_mvs = os.path.join(mvs_out, "scene_dense.mvs")
         target_scene = "scene_dense.mvs" if os.path.exists(dense_mvs) else "scene.mvs"
-        if target_scene == "scene.mvs":
-            self.log_message.emit("[WARNING] scene_dense.mvs not found. Meshing from sparse scene.mvs.")
 
-        if fused_mesh_name and os.path.exists(os.path.join(mvs_out, fused_mesh_name)):
-            self.log_message.emit(f"[INFO] Skipping ReconstructMesh (Delaunay) — using Reference Cloud fused Poisson mesh: {fused_mesh_name}")
-            mesh_input = fused_mesh_name
+        if self._should_skip("mesh_reconstructed"):
+            self.log_message.emit("[RESUME] Skipping Step 7 (Surface Mesh Reconstruction already complete).")
+            if os.path.exists(os.path.join(mvs_out, "scene_dense_mesh.ply")):
+                mesh_input = "scene_dense_mesh.ply"
+            else:
+                mesh_input = "scene_mesh.ply"
+            self.progress_changed.emit(88)
         else:
+            self.status_changed.emit(f"Step 7/{total_steps}: Reconstructing Surface Mesh...")
+            mvs_mesh_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["ReconstructMesh"])
+
+            if target_scene == "scene.mvs":
+                self.log_message.emit("[WARNING] scene_dense.mvs not found. Meshing from sparse scene.mvs.")
+
             cmd = [
                 mvs_mesh_exe,
                 target_scene,
@@ -1314,84 +1397,105 @@ class PipelineWorker(QThread):
             else:
                 mesh_input = "scene_mesh.ply"
 
-        self.progress_changed.emit(88)
+            self._backup_checkpoint("mesh_reconstructed")
+            self.progress_changed.emit(88)
 
         # =========================================================================
         # STEP 8 — Mesh Geometry Refinement (Multi-Scale)
         # =========================================================================
-        total_steps = 10 if self.auto_cleanup else 9
-        self.status_changed.emit(f"Step 8/{total_steps}: Refining Mesh Geometry...")
-        mvs_refine_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["RefineMesh"])
-
+        refine_mvs_output = "scene_dense_mesh_refine.mvs"
         if not os.path.exists(os.path.join(mvs_out, mesh_input)):
-            for candidate in ["scene_dense_mesh_refcloud.ply", "scene_dense_mesh.ply", "scene_mesh.ply"]:
+            for candidate in ["scene_dense_mesh.ply", "scene_mesh.ply"]:
                 if os.path.exists(os.path.join(mvs_out, candidate)):
                     mesh_input = candidate
                     break
 
-        refine_mvs_output = "scene_dense_mesh_refine.mvs"
-        cmd = [
-            mvs_refine_exe,
-            target_scene,
-            "-m",              mesh_input,
-            "-o",              refine_mvs_output,
-            "--resolution-level", refine_res,
-            "--scales",        refine_scales,
-            "--gradient-step", "25.05",
-            "--max-face-area", "16",
-        ]
-
-        refine_ok = self._run_process_realtime(cmd, timeout=7200.0, cwd=mvs_out, env=env)
-        refined_mvs_path = os.path.join(mvs_out, refine_mvs_output)
-        refined_ply_path = os.path.join(mvs_out, "scene_dense_mesh_refine.ply")
-
-        if refine_ok and (os.path.exists(refined_mvs_path) or os.path.exists(refined_ply_path)):
-            texture_input_scene = refine_mvs_output if os.path.exists(refined_mvs_path) else target_scene
-            self.log_message.emit(f"[INFO] RefineMesh succeeded. Using {texture_input_scene} for texturing.")
+        if self._should_skip("mesh_refined"):
+            self.log_message.emit("[RESUME] Skipping Step 8 (Mesh Geometry Refinement already complete).")
+            refined_mvs_path = os.path.join(mvs_out, refine_mvs_output)
+            refined_ply_path = os.path.join(mvs_out, "scene_dense_mesh_refine.ply")
+            if os.path.exists(refined_mvs_path) or os.path.exists(refined_ply_path):
+                texture_input_scene = refine_mvs_output if os.path.exists(refined_mvs_path) else target_scene
+            else:
+                texture_input_scene = target_scene
+            self.progress_changed.emit(91 if self.auto_cleanup else 94)
         else:
-            texture_input_scene = target_scene
-            self.log_message.emit(f"[WARNING] RefineMesh failed or produced no output. Texturing will use {target_scene}.")
+            self.status_changed.emit(f"Step 8/{total_steps}: Refining Mesh Geometry...")
+            mvs_refine_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["RefineMesh"])
 
-        self.progress_changed.emit(91 if self.auto_cleanup else 94)
+            cmd = [
+                mvs_refine_exe,
+                target_scene,
+                "-m",              mesh_input,
+                "-o",              refine_mvs_output,
+                "--resolution-level", refine_res,
+                "--scales",        refine_scales,
+                "--gradient-step", "25.05",
+                "--max-face-area", "16",
+            ]
+
+            refine_ok = self._run_process_realtime(cmd, timeout=7200.0, cwd=mvs_out, env=env)
+            refined_mvs_path = os.path.join(mvs_out, refine_mvs_output)
+            refined_ply_path = os.path.join(mvs_out, "scene_dense_mesh_refine.ply")
+
+            if refine_ok and (os.path.exists(refined_mvs_path) or os.path.exists(refined_ply_path)):
+                texture_input_scene = refine_mvs_output if os.path.exists(refined_mvs_path) else target_scene
+                self.log_message.emit(f"[INFO] RefineMesh succeeded. Using {texture_input_scene} for texturing.")
+            else:
+                texture_input_scene = target_scene
+                self.log_message.emit(f"[WARNING] RefineMesh failed or produced no output. Texturing will use {target_scene}.")
+
+            self._backup_checkpoint("mesh_refined")
+            self.progress_changed.emit(91 if self.auto_cleanup else 94)
 
         # =========================================================================
         # STEP 8.5 (Conditional) — PyMeshLab Auto Cleanup & Decimation
         # =========================================================================
         if self.auto_cleanup:
-            self.status_changed.emit(f"Step 9/{total_steps}: Auto-Cleaning Mesh...")
-            cleanup_input_ply = None
-            for candidate in ["scene_dense_mesh_refine.ply", "scene_dense_mesh_refcloud.ply", "scene_dense_mesh.ply", "scene_mesh.ply"]:
-                candidate_path = os.path.join(mvs_out, candidate)
-                if os.path.exists(candidate_path):
-                    cleanup_input_ply = candidate_path
-                    break
-
-            if cleanup_input_ply:
-                cleaned_ply_path = os.path.join(mvs_out, "scene_dense_mesh_cleaned.ply")
-                try:
-                    from mesh_cleanup import run_mesh_cleanup
-                    cleanup_params = self.custom_params.get("cleanup_params") if self.custom_params else None
-                    cleanup_ok = run_mesh_cleanup(cleanup_input_ply, cleaned_ply_path, self.log_message.emit, cleanup_params=cleanup_params)
-                    if cleanup_ok and os.path.exists(cleaned_ply_path):
-                        self.log_message.emit("[INFO] Auto Cleanup completed successfully. Cleaned mesh ready for texturing.")
-                    else:
-                        self.log_message.emit("[WARNING] Auto Cleanup failed or produced no output. Texturing will use refined mesh.")
-                except Exception as e:
-                    self.log_message.emit(f"[WARNING] Error running mesh cleanup: {e}. Continuing pipeline.")
+            if self._should_skip("mesh_cleaned"):
+                self.log_message.emit("[RESUME] Skipping Step 9 (Auto-Cleaning Mesh already complete).")
+                self.progress_changed.emit(95)
             else:
-                self.log_message.emit("[WARNING] No suitable PLY mesh found for Auto Cleanup. Skipping cleanup stage.")
+                self.status_changed.emit(f"Step 9/{total_steps}: Auto-Cleaning Mesh...")
+                cleanup_input_ply = None
+                for candidate in ["scene_dense_mesh_refine.ply", "scene_dense_mesh.ply", "scene_mesh.ply"]:
+                    candidate_path = os.path.join(mvs_out, candidate)
+                    if os.path.exists(candidate_path):
+                        cleanup_input_ply = candidate_path
+                        break
 
-            self.progress_changed.emit(95)
+                if cleanup_input_ply:
+                    cleaned_ply_path = os.path.join(mvs_out, "scene_dense_mesh_cleaned.ply")
+                    try:
+                        from mesh_cleanup import run_mesh_cleanup
+                        cleanup_params = self.custom_params.get("cleanup_params") if self.custom_params else None
+                        cleanup_ok = run_mesh_cleanup(cleanup_input_ply, cleaned_ply_path, self.log_message.emit, cleanup_params=cleanup_params)
+                        if cleanup_ok and os.path.exists(cleaned_ply_path):
+                            self.log_message.emit("[INFO] Auto Cleanup completed successfully. Cleaned mesh ready for texturing.")
+                        else:
+                            self.log_message.emit("[WARNING] Auto Cleanup failed or produced no output. Texturing will use refined mesh.")
+                    except Exception as e:
+                        self.log_message.emit(f"[WARNING] Error running mesh cleanup: {e}. Continuing pipeline.")
+                else:
+                    self.log_message.emit("[WARNING] No suitable PLY mesh found for Auto Cleanup. Skipping cleanup stage.")
+
+                self._backup_checkpoint("mesh_cleaned")
+                self.progress_changed.emit(95)
 
         # =========================================================================
         # STEP 9/10 — Texture Projection
         # =========================================================================
+        if self._should_skip("mesh_textured"):
+            self.log_message.emit("[RESUME] Skipping Texture Projection (already complete).")
+            self.progress_changed.emit(99)
+            return True
+
         step_num = 10 if self.auto_cleanup else 9
         self.status_changed.emit(f"Step {step_num}/{total_steps}: Projecting Textures onto Mesh...")
         mvs_texture_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["TextureMesh"])
 
         texture_mesh_ply = None
-        candidates = ["scene_dense_mesh_cleaned.ply", "scene_dense_mesh_refine.ply", "scene_dense_mesh_refcloud.ply", "scene_dense_mesh.ply", "scene_mesh.ply"] if self.auto_cleanup else ["scene_dense_mesh_refine.ply", "scene_dense_mesh_refcloud.ply", "scene_dense_mesh.ply", "scene_mesh.ply"]
+        candidates = ["scene_dense_mesh_cleaned.ply", "scene_dense_mesh_refine.ply", "scene_dense_mesh.ply", "scene_mesh.ply"] if self.auto_cleanup else ["scene_dense_mesh_refine.ply", "scene_dense_mesh.ply", "scene_mesh.ply"]
         for candidate in candidates:
             if os.path.exists(os.path.join(mvs_out, candidate)):
                 texture_mesh_ply = candidate
@@ -1410,8 +1514,8 @@ class PipelineWorker(QThread):
             "--resolution-level",    texture_res,
             "--cost-smoothness-ratio", "0.1",
             "--empty-color",         "0",
-            "--local-seam-leveling",  "0",       # Force turns off local patch edge blending
-            "--global-seam-leveling", "0",       # Force turns off global color adjustment
+            "--local-seam-leveling",  "0",
+            "--global-seam-leveling", "0",
         ]
         texture_ply_ok = self._run_process_realtime(cmd_ply, timeout=1800.0, cwd=mvs_out, env=env)
         if not texture_ply_ok:
@@ -1427,8 +1531,8 @@ class PipelineWorker(QThread):
                 "--resolution-level",    texture_res,
                 "--cost-smoothness-ratio", "0.1",
                 "--empty-color",         "0",
-                "--local-seam-leveling",  "0",       # Force turns off local patch edge blending
-                "--global-seam-leveling", "0",       # Force turns off global color adjustment
+                "--local-seam-leveling",  "0",
+                "--global-seam-leveling", "0",
             ]
             self._run_process_realtime(cmd_obj, timeout=1800.0, cwd=mvs_out, env=env)
 
@@ -1448,8 +1552,9 @@ class PipelineWorker(QThread):
             self.log_message.emit("[WARNING] TextureMesh PLY pass failed. Skipping OBJ export pass.")
 
         self.progress_changed.emit(99)
-        self._backup_checkpoint("mesh_reconstruction")
+        self._backup_checkpoint("mesh_textured")
         return True
+
     def _run_simulated_pipeline(self) -> bool:
         """Runs a visual simulation of the pipeline for testing UI and fallback states."""
         if self.auto_cleanup:
@@ -1754,74 +1859,6 @@ class PipelineWorker(QThread):
                     best_count = size
                     best_dir = model_dir
         return best_dir
-
-    def _run_reference_cloud_fusion(self, mvs_out: str) -> str | None:
-        """
-        Step 6b: Optional reference cloud alignment, gap fusion, and Poisson meshing.
-        Returns the filename of the generated fused mesh PLY, or None if skipped/failed.
-        """
-        if not self.ref_cloud_path or not os.path.exists(self.ref_cloud_path):
-            return None
-
-        self.status_changed.emit("Step 6b: Aligning & Fusing Reference Cloud...")
-        self.log_message.emit(f"[REF_CLOUD] Starting reference cloud alignment and fusion pipeline...")
-
-        dense_ply = os.path.join(mvs_out, "scene_dense.ply")
-        if not os.path.exists(dense_ply):
-            dense_ply = os.path.join(mvs_out, "scene.ply")
-        if not os.path.exists(dense_ply):
-            self.log_message.emit("[WARNING] No dense or sparse PLY cloud found for reference cloud alignment. Skipping fusion.")
-            return None
-
-        try:
-            import point_cloud_io
-            import cloud_aligner
-            import cloud_fusion
-            import open3d as o3d
-
-            # 1. Load point clouds
-            ref_load = point_cloud_io.load_point_cloud(self.ref_cloud_path, self.log_message.emit)
-            if not ref_load.success or ref_load.cloud is None:
-                self.log_message.emit(f"[WARNING] Failed to load reference cloud: {'; '.join(ref_load.warnings)}. Skipping fusion.")
-                return None
-
-            dense_load = point_cloud_io.load_point_cloud(dense_ply, self.log_message.emit)
-            if not dense_load.success or dense_load.cloud is None:
-                self.log_message.emit(f"[WARNING] Failed to load scene point cloud ({dense_ply}). Skipping fusion.")
-                return None
-
-            # 2. Align reference cloud to scene point cloud
-            align_res = cloud_aligner.align_to_dense(ref_load.cloud, dense_load.cloud, self.log_message.emit)
-            if not align_res.success:
-                self.log_message.emit(f"[WARNING] Reference cloud alignment low confidence: {'; '.join(align_res.warnings)}. Continuing without fusion.")
-                return None
-
-            # 3. Transform reference cloud using similarity matrix
-            aligned_ref = ref_load.cloud.transform(align_res.transform)
-
-            # Save aligned reference cloud for diagnostics
-            aligned_ref_path = os.path.join(mvs_out, "scene_refcloud_aligned.ply")
-            point_cloud_io.save_point_cloud(aligned_ref, aligned_ref_path)
-
-            # 4. Merge gap-filling points into dense cloud
-            merged_cloud = cloud_fusion.merge_clouds(dense_load.cloud, aligned_ref, self.log_message.emit, gap_radius_mult=3.0)
-
-            merged_cloud_path = os.path.join(mvs_out, "scene_dense_refcloud.ply")
-            point_cloud_io.save_point_cloud(merged_cloud, merged_cloud_path)
-
-            # 5. Generate Poisson surface mesh
-            fused_mesh = cloud_fusion.generate_mesh(merged_cloud, self.log_message.emit, poisson_depth=9, density_threshold_pct=5.0)
-
-            fused_mesh_name = "scene_dense_mesh_refcloud.ply"
-            fused_mesh_path = os.path.join(mvs_out, fused_mesh_name)
-            o3d.io.write_triangle_mesh(fused_mesh_path, fused_mesh)
-
-            self.log_message.emit(f"[SUCCESS] Reference cloud fusion complete! Fused Poisson mesh saved as {fused_mesh_name}")
-            return fused_mesh_name
-
-        except Exception as e:
-            self.log_message.emit(f"[WARNING] Reference cloud fusion encountered an error: {e}. Falling back to standard pipeline.")
-            return None
 
     def _run_model_analyzer(self, model_dir: str) -> dict:
         """Runs COLMAP model_analyzer and returns parsed stats."""
@@ -2334,7 +2371,7 @@ class PipelineWorker(QThread):
 
     def _run_poisson_reconstruction(self, mvs_out: str, depth: int) -> bool:
         """
-        Step 7P: Poisson Surface Reconstruction using Open3D and cloud_fusion module.
+        Step 7P: Poisson Surface Reconstruction using Open3D.
         Reads the dense point cloud, reconstructs surface, trims low-density components,
         and saves PLY, OBJ, and GLB mesh outputs.
         """
@@ -2351,7 +2388,6 @@ class PipelineWorker(QThread):
 
         try:
             import open3d as o3d
-            import cloud_fusion
             import trimesh
             import numpy as np
 
@@ -2362,17 +2398,32 @@ class PipelineWorker(QThread):
                 self.log_message.emit("[ERROR] Point cloud is empty or failed to load.")
                 return False
 
-            self.status_changed.emit("Step 7P: Reconstructing Poisson Surface...")
-            self.progress_changed.emit(83)
+            self.status_changed.emit("Step 7P: Estimating Normals & Cleaning...")
+            self.progress_changed.emit(82)
 
-            # Generate Poisson mesh using the cloud_fusion module's helper
-            # This handles normal estimation, orientation consistency check, density trimming, and cluster fragment cleaning.
-            mesh = cloud_fusion.generate_mesh(
-                pcd, 
-                log_fn=self.log_message.emit, 
-                poisson_depth=depth, 
-                density_threshold_pct=5.0
-            )
+            if not pcd.has_normals():
+                self.log_message.emit("[POISSON] Estimating normals...")
+                bbox = pcd.get_axis_aligned_bounding_box()
+                extent = np.asarray(bbox.get_extent())
+                radius_normal = float(np.max(extent)) * 0.015
+                if radius_normal <= 0:
+                    radius_normal = 0.05
+                pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+                pcd.orient_normals_consistent_tangent_plane(k=15)
+
+            self.status_changed.emit("Step 7P: Reconstructing Poisson Surface...")
+            self.progress_changed.emit(85)
+
+            with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+                mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                    pcd, depth=depth, linear_fit=True
+                )
+
+            densities_np = np.asarray(densities)
+            if len(densities_np) > 0:
+                cutoff_density = np.percentile(densities_np, 5.0)
+                vertices_to_remove = densities_np < cutoff_density
+                mesh.remove_vertices_by_mask(vertices_to_remove)
 
             if mesh is None or len(mesh.vertices) == 0:
                 self.log_message.emit("[ERROR] Poisson reconstruction produced an empty mesh.")
@@ -2411,5 +2462,501 @@ class PipelineWorker(QThread):
             import traceback
             self.log_message.emit(traceback.format_exc())
             return False
+
+
+class CleanupAndTextureWorker(PipelineWorker):
+    """
+    Dedicated worker thread for executing Mesh Cleanup + TextureMesh standalone.
+    Operates directly on existing reconstructed meshes without re-running SfM or MVS densification.
+    """
+    def __init__(self, output_dir: str, cleanup_params: dict = None, custom_params: dict = None, quality_preset: str = "medium", parent=None):
+        super().__init__(
+            image_dir=None,
+            output_dir=output_dir,
+            quality_preset=quality_preset,
+            gpu_mode="auto",
+            has_plain_surfaces=False,
+            auto_cleanup=True,
+            mapper_mode="incremental",
+            mesh_mode="default",
+            poisson_depth=9,
+            custom_params=custom_params or {},
+            resume_from_step=None,
+            parent=parent
+        )
+        self.cleanup_params = cleanup_params or {}
+        if custom_params and "cleanup_params" in custom_params:
+            self.cleanup_params = custom_params["cleanup_params"]
+
+    def run(self):
+        try:
+            self.status_changed.emit("Initializing Mesh Cleanup & Texturing...")
+            self.progress_changed.emit(5)
+            time.sleep(0.3)
+
+            has_binaries = self._verify_binaries()
+            mvs_out = os.path.join(self.output_dir, "mvs")
+            base_dir = get_base_dir()
+            env = self._get_safe_env()
+
+            if not os.path.exists(mvs_out):
+                self.log_message.emit(f"[ERROR] MVS directory does not exist: {mvs_out}")
+                self.finished.emit(False, "MVS directory not found.")
+                return
+
+            # Find base mesh candidate to clean
+            cleanup_input_ply = None
+            for candidate in ["scene_dense_mesh_refine.ply", "scene_dense_mesh.ply", "scene_mesh.ply"]:
+                candidate_path = os.path.join(mvs_out, candidate)
+                if os.path.exists(candidate_path):
+                    cleanup_input_ply = candidate_path
+                    break
+
+            if not cleanup_input_ply:
+                self.log_message.emit("[ERROR] No suitable base mesh PLY found for cleanup.")
+                self.finished.emit(False, "No mesh found to clean.")
+                return
+
+            # STEP 1: Mesh Cleanup & Repair
+            self.status_changed.emit("Step 1/2: Auto-Cleaning & Decimating Mesh...")
+            self.progress_changed.emit(20)
+            cleaned_ply_path = os.path.join(mvs_out, "scene_dense_mesh_cleaned.ply")
+
+            from mesh_cleanup import run_mesh_cleanup
+            self.log_message.emit(f"[CLEANUP] Starting cleanup on {os.path.basename(cleanup_input_ply)}...")
+            cleanup_ok = run_mesh_cleanup(cleanup_input_ply, cleaned_ply_path, self.log_message.emit, cleanup_params=self.cleanup_params)
+            
+            if not cleanup_ok or not os.path.exists(cleaned_ply_path):
+                self.log_message.emit("[WARNING] Cleanup did not produce a cleaned mesh. Falling back to source mesh for texturing.")
+                texture_mesh_ply = os.path.basename(cleanup_input_ply)
+            else:
+                self.log_message.emit("[INFO] Mesh cleanup successful. Cleaned mesh ready for texturing.")
+                texture_mesh_ply = "scene_dense_mesh_cleaned.ply"
+
+            self.progress_changed.emit(50)
+
+            # STEP 2: Texture Projection
+            self.status_changed.emit("Step 2/2: Projecting Textures onto Mesh...")
+            
+            # Determine texture input scene
+            texture_input_scene = "scene.mvs"
+            for scene_cand in ["scene_dense_mesh_refine.mvs", "scene_dense.mvs", "scene.mvs"]:
+                if os.path.exists(os.path.join(mvs_out, scene_cand)):
+                    texture_input_scene = scene_cand
+                    break
+
+            texture_res = "1"
+            if self.custom_params and "texture_res" in self.custom_params:
+                texture_res = str(self.custom_params["texture_res"])
+            elif self.quality_preset == "preview":
+                texture_res = "2"
+            elif self.quality_preset == "ultra":
+                texture_res = "0"
+
+            if has_binaries and "openMVS" in self.toolchain_map and "TextureMesh" in self.toolchain_map["openMVS"]:
+                mvs_texture_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["TextureMesh"])
+                cmd_ply = [
+                    mvs_texture_exe,
+                    texture_input_scene,
+                    "-m",                    texture_mesh_ply,
+                    "-o",                    "scene_dense_mesh_texture.mvs",
+                    "--resolution-level",    texture_res,
+                    "--cost-smoothness-ratio", "0.1",
+                    "--empty-color",         "0",
+                    "--local-seam-leveling",  "0",
+                    "--global-seam-leveling", "0",
+                ]
+                self.log_message.emit(f"[RUN] Texturing PLY: {' '.join(cmd_ply)}")
+                texture_ply_ok = self._run_process_realtime(cmd_ply, timeout=1800.0, cwd=mvs_out, env=env)
+                
+                self.progress_changed.emit(80)
+                if texture_ply_ok:
+                    cmd_obj = [
+                        mvs_texture_exe,
+                        texture_input_scene,
+                        "-m",                    texture_mesh_ply,
+                        "-o",                    "scene_dense_mesh_texture.obj",
+                        "--export-type",         "obj",
+                        "--resolution-level",    texture_res,
+                        "--cost-smoothness-ratio", "0.1",
+                        "--empty-color",         "0",
+                        "--local-seam-leveling",  "0",
+                        "--global-seam-leveling", "0",
+                    ]
+                    self.log_message.emit(f"[RUN] Texturing OBJ: {' '.join(cmd_obj)}")
+                    self._run_process_realtime(cmd_obj, timeout=1800.0, cwd=mvs_out, env=env)
+
+                    # Auto-export GLB via trimesh
+                    try:
+                        import trimesh
+                        obj_file = os.path.join(mvs_out, "scene_dense_mesh_texture.obj")
+                        glb_file = os.path.join(mvs_out, "scene_dense_mesh_texture.glb")
+                        if os.path.exists(obj_file):
+                            self.log_message.emit("[INFO] Pre-generating textured GLB mesh...")
+                            mesh_obj = trimesh.load(obj_file)
+                            mesh_obj.export(glb_file, file_type="glb")
+                            self.log_message.emit(f"[SUCCESS] GLB mesh successfully generated: {os.path.basename(glb_file)}")
+                    except Exception as e:
+                        self.log_message.emit(f"[WARNING] Automatic GLB conversion from OBJ skipped: {e}")
+                else:
+                    self.log_message.emit("[WARNING] TextureMesh pass failed.")
+            else:
+                self.log_message.emit("[WARNING] OpenMVS TextureMesh binary not found. Skipping texture projection.")
+
+            self.progress_changed.emit(100)
+            self.status_changed.emit("Mesh Cleanup & Texturing Complete")
+            self.finished.emit(True, "Mesh cleanup and texturing completed successfully.")
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Cleanup and texturing worker failed: {e}")
+            import traceback
+            self.log_message.emit(traceback.format_exc())
+            self.finished.emit(False, str(e))
+
+
+class MeshOperationWorker(QThread):
+    """
+    Dedicated worker thread for executing isolated mesh operations:
+    Cleanup, Merge Close Vertices, and Taubin Smoothing.
+    """
+    status_changed   = Signal(str)
+    progress_changed = Signal(int)
+    log_message      = Signal(str)
+    finished         = Signal(bool, str, str)  # (success, output_ply_path, summary_msg)
+
+    def __init__(self, operation: str, input_ply: str, output_ply: str, params: dict = None, parent=None):
+        super().__init__(parent)
+        self.operation  = operation
+        self.input_ply  = input_ply
+        self.output_ply = output_ply
+        self.params     = params or {}
+
+    def run(self):
+        try:
+            from mesh_cleanup import get_backend
+            backend = get_backend()
+            self.status_changed.emit(f"Running {self.operation} via {backend.name}...")
+            self.progress_changed.emit(15)
+
+            if not os.path.isfile(self.input_ply):
+                err = f"Input mesh file not found: {self.input_ply}"
+                self.log_message.emit(f"[ERROR] {err}")
+                self.finished.emit(False, "", err)
+                return
+
+            self.progress_changed.emit(30)
+            ok = False
+            op_label = ""
+
+            if self.operation == "cleanup":
+                op_label = "Mesh Cleanup"
+                ok = backend.cleanup(
+                    self.input_ply,
+                    self.output_ply,
+                    log_callback=self.log_message.emit,
+                    cleanup_params=self.params
+                )
+            elif self.operation == "merge_by_distance":
+                op_label = "Merge Vertices"
+                threshold_pct = float(self.params.get("threshold_pct", 1.0))
+                bbox_diagonal = float(self.params.get("bbox_diagonal", 0.0))
+                ok = backend.merge_by_distance(
+                    self.input_ply,
+                    self.output_ply,
+                    threshold_pct=threshold_pct,
+                    bbox_diagonal=bbox_diagonal,
+                    log_callback=self.log_message.emit
+                )
+            elif self.operation == "smooth_taubin":
+                op_label = "Smooth Mesh"
+                lambda_factor = float(self.params.get("lambda_factor", 0.5))
+                mu_factor = self.params.get("mu_factor", None)
+                if mu_factor is not None:
+                    mu_factor = float(mu_factor)
+                iterations = int(self.params.get("iterations", 10))
+                ok = backend.smooth_taubin(
+                    self.input_ply,
+                    self.output_ply,
+                    lambda_factor=lambda_factor,
+                    mu_factor=mu_factor,
+                    iterations=iterations,
+                    log_callback=self.log_message.emit
+                )
+            else:
+                err = f"Unknown mesh operation: {self.operation}"
+                self.log_message.emit(f"[ERROR] {err}")
+                self.finished.emit(False, "", err)
+                return
+
+            self.progress_changed.emit(90)
+            if ok and os.path.isfile(self.output_ply) and os.path.getsize(self.output_ply) > 0:
+                self.progress_changed.emit(100)
+                self.status_changed.emit(f"{op_label} Complete")
+                self.finished.emit(True, self.output_ply, f"{op_label} completed successfully.")
+            else:
+                self.status_changed.emit(f"{op_label} Failed")
+                self.finished.emit(False, "", f"{op_label} did not produce a valid output mesh.")
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Mesh operation exception: {e}")
+            import traceback
+            self.log_message.emit(traceback.format_exc())
+            self.finished.emit(False, "", str(e))
+
+
+class RetextureOnlyWorker(PipelineWorker):
+    """
+    Dedicated worker thread for re-projecting OpenMVS textures onto a modified mesh.
+    Reuses the exact scene.mvs resolution logic from the reconstruction pipeline.
+    """
+    def __init__(self, output_dir: str, target_mesh_ply: str, custom_params: dict = None, quality_preset: str = "medium", parent=None):
+        super().__init__(
+            image_dir=None,
+            output_dir=output_dir,
+            quality_preset=quality_preset,
+            gpu_mode="auto",
+            has_plain_surfaces=False,
+            auto_cleanup=False,
+            mapper_mode="incremental",
+            mesh_mode="default",
+            poisson_depth=9,
+            custom_params=custom_params or {},
+            resume_from_step=None,
+            parent=parent
+        )
+        self.target_mesh_ply = target_mesh_ply
+
+    def run(self):
+        try:
+            self.status_changed.emit("Initializing Texture Projection...")
+            self.progress_changed.emit(10)
+
+            has_binaries = self._verify_binaries()
+            mvs_out = self.output_dir if os.path.basename(self.output_dir) == "mvs" else os.path.join(self.output_dir, "mvs")
+            base_dir = get_base_dir()
+            env = self._get_safe_env()
+
+            if not os.path.exists(mvs_out):
+                self.log_message.emit(f"[ERROR] MVS directory does not exist: {mvs_out}")
+                self.finished.emit(False, "MVS directory not found.")
+                return
+
+            # Determine texture input scene using standard pipeline resolution
+            texture_input_scene = "scene.mvs"
+            for scene_cand in ["scene_dense_mesh_refine.mvs", "scene_dense.mvs", "scene.mvs"]:
+                if os.path.exists(os.path.join(mvs_out, scene_cand)):
+                    texture_input_scene = scene_cand
+                    break
+
+            scene_mvs_path = os.path.join(mvs_out, texture_input_scene)
+            if not os.path.isfile(scene_mvs_path):
+                self.log_message.emit(f"[ERROR] Required reconstruction scene ({texture_input_scene}) not found in: {mvs_out}")
+                self.finished.emit(False, f"Required project file '{texture_input_scene}' not found on disk.")
+                return
+
+            texture_mesh_input = self.target_mesh_ply
+            if os.path.isabs(texture_mesh_input):
+                # Copy or use relative to mvs_out
+                rel = os.path.relpath(texture_mesh_input, mvs_out)
+                if not rel.startswith(".."):
+                    texture_mesh_input = rel
+
+            texture_res = "1"
+            if self.custom_params and "texture_res" in self.custom_params:
+                texture_res = str(self.custom_params["texture_res"])
+            elif self.quality_preset == "preview":
+                texture_res = "2"
+            elif self.quality_preset == "ultra":
+                texture_res = "0"
+
+            if has_binaries and "openMVS" in self.toolchain_map and "TextureMesh" in self.toolchain_map["openMVS"]:
+                mvs_texture_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["TextureMesh"])
+                cmd_ply = [
+                    mvs_texture_exe,
+                    texture_input_scene,
+                    "-m",                    texture_mesh_input,
+                    "-o",                    "scene_dense_mesh_texture.mvs",
+                    "--resolution-level",    texture_res,
+                    "--cost-smoothness-ratio", "0.1",
+                    "--empty-color",         "0",
+                    "--local-seam-leveling",  "0",
+                    "--global-seam-leveling", "0",
+                ]
+                self.status_changed.emit("Projecting Textures (PLY pass)...")
+                self.progress_changed.emit(30)
+                self.log_message.emit(f"[RUN] Texturing PLY: {' '.join(cmd_ply)}")
+                texture_ply_ok = self._run_process_realtime(cmd_ply, timeout=1800.0, cwd=mvs_out, env=env)
+
+                self.progress_changed.emit(70)
+                if texture_ply_ok:
+                    cmd_obj = [
+                        mvs_texture_exe,
+                        texture_input_scene,
+                        "-m",                    texture_mesh_input,
+                        "-o",                    "scene_dense_mesh_texture.obj",
+                        "--export-type",         "obj",
+                        "--resolution-level",    texture_res,
+                        "--cost-smoothness-ratio", "0.1",
+                        "--empty-color",         "0",
+                        "--local-seam-leveling",  "0",
+                        "--global-seam-leveling", "0",
+                    ]
+                    self.status_changed.emit("Exporting Textured OBJ...")
+                    self.log_message.emit(f"[RUN] Texturing OBJ: {' '.join(cmd_obj)}")
+                    self._run_process_realtime(cmd_obj, timeout=1800.0, cwd=mvs_out, env=env)
+
+                    # Auto-export GLB via trimesh
+                    try:
+                        import trimesh
+                        obj_file = os.path.join(mvs_out, "scene_dense_mesh_texture.obj")
+                        glb_file = os.path.join(mvs_out, "scene_dense_mesh_texture.glb")
+                        if os.path.exists(obj_file):
+                            self.log_message.emit("[INFO] Pre-generating textured GLB mesh...")
+                            mesh_obj = trimesh.load(obj_file)
+                            mesh_obj.export(glb_file, file_type="glb")
+                            self.log_message.emit(f"[SUCCESS] GLB mesh successfully generated: {os.path.basename(glb_file)}")
+                    except Exception as e:
+                        self.log_message.emit(f"[WARNING] Automatic GLB conversion from OBJ skipped: {e}")
+
+                    self.progress_changed.emit(100)
+                    self.status_changed.emit("Texture Projection Complete")
+                    self.finished.emit(True, "Mesh retexturing completed successfully.")
+                else:
+                    self.log_message.emit("[WARNING] TextureMesh PLY pass failed.")
+                    self.finished.emit(False, "TextureMesh execution failed.")
+            else:
+                self.log_message.emit("[WARNING] OpenMVS TextureMesh binary not found.")
+                self.finished.emit(False, "OpenMVS TextureMesh binary not found.")
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Retexture worker failed: {e}")
+            import traceback
+            self.log_message.emit(traceback.format_exc())
+            self.finished.emit(False, str(e))
+
+
+class BackgroundRemovalWorker(QThread):
+    """
+    Worker thread that executes background removal offline on a list of image files
+    using the compact silueta.onnx model.
+    Clones the images into a project working directory (preserving original source files).
+    """
+    progress_changed = Signal(int)
+    status_changed = Signal(str)
+    log_message = Signal(str)
+    finished = Signal(bool, list, str)
+
+    def __init__(self, image_paths: list, output_dir: str = None, parent=None):
+        super().__init__(parent)
+        self.image_paths = list(image_paths)
+        self.output_dir = output_dir
+        self.is_running = True
+
+    def run(self):
+        try:
+            # Set U2NET_HOME to local models directory before importing/initializing rembg
+            models_dir = os.path.join(get_base_dir(), "models")
+            if not os.path.isdir(models_dir):
+                alt_models = os.path.join(get_base_dir(), "_internal", "models")
+                if os.path.isdir(alt_models):
+                    models_dir = alt_models
+            from model_assets import validate_silueta
+            try:
+                validate_silueta(os.path.join(models_dir, "silueta.onnx"))
+            except ValueError as exc:
+                self.log_message.emit(f"[ERROR] {exc}")
+                self.finished.emit(False, self.image_paths, str(exc))
+                return
+            os.environ["U2NET_HOME"] = models_dir
+
+            # Guard against PyInstaller environments where package metadata for pymatting or rembg is stripped
+            try:
+                import importlib.metadata
+                _orig_metadata_version = importlib.metadata.version
+
+                def _safe_metadata_version(distribution_name):
+                    try:
+                        return _orig_metadata_version(distribution_name)
+                    except (importlib.metadata.PackageNotFoundError, Exception):
+                        if distribution_name in ("pymatting", "rembg"):
+                            return "1.1.12"
+                        raise
+
+                importlib.metadata.version = _safe_metadata_version
+            except Exception:
+                pass
+
+            import rembg
+            from PIL import Image
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Failed to import rembg or PIL: {e}")
+            self.finished.emit(False, self.image_paths, f"Required dependencies not installed: {e}")
+            return
+
+        total = len(self.image_paths)
+        if total == 0:
+            self.finished.emit(True, [], "No images provided.")
+            return
+
+        out_dir = self.output_dir
+        if not out_dir:
+            base_dir = get_base_dir()
+            out_dir = os.path.join(base_dir, "reconstruction_out", "bg_removed_images")
+        os.makedirs(out_dir, exist_ok=True)
+
+        self.log_message.emit(f"[START] Initializing offline background removal for {total} images...")
+        self.log_message.emit(f"[INFO] Source files will be preserved. Transparent copies saved to: {out_dir}")
+
+        try:
+            session = rembg.new_session("silueta")
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Failed to initialize silueta ONNX session: {e}")
+            self.finished.emit(False, self.image_paths, f"Failed to initialize AI model session: {e}")
+            return
+
+        updated_paths = []
+        used_names = set()
+
+        for i, path in enumerate(self.image_paths):
+            if not self.is_running:
+                self.log_message.emit("[INFO] Background removal cancelled by user.")
+                self.finished.emit(False, self.image_paths, "Background removal cancelled by user.")
+                return
+
+            self.status_changed.emit(f"Removing background: {i + 1}/{total}")
+            self.progress_changed.emit(int((i / total) * 100))
+            filename = os.path.basename(path)
+            self.log_message.emit(f"[BG_REMOVE] Processing ({i + 1}/{total}): {filename}")
+
+            try:
+                # Open source image using Pillow
+                with Image.open(path) as img:
+                    # Run background removal using silueta session
+                    output = rembg.remove(img, session=session)
+
+                    # Determine unique destination filename in out_dir
+                    base_stem, _ = os.path.splitext(filename)
+                    target_name = f"{base_stem}.png"
+                    counter = 1
+                    while target_name.lower() in used_names:
+                        target_name = f"{base_stem}_{counter}.png"
+                        counter += 1
+                    used_names.add(target_name.lower())
+
+                    dst_path = os.path.join(out_dir, target_name)
+                    output.save(dst_path, "PNG")
+
+                    norm_dst = os.path.normpath(dst_path)
+                    updated_paths.append(norm_dst)
+                    self.log_message.emit(f"[BG_REMOVE] Saved transparent clone: {os.path.basename(norm_dst)}")
+
+            except Exception as e:
+                self.log_message.emit(f"[ERROR] Failed to process {filename}: {e}")
+                # Fallback: keep original path
+                updated_paths.append(path)
+
+        self.progress_changed.emit(100)
+        self.status_changed.emit("Background removal complete!")
+        self.finished.emit(True, updated_paths, f"Successfully created {len(updated_paths)} transparent clones in {os.path.basename(out_dir)}.")
+
+    def stop(self):
+        self.is_running = False
 
 
