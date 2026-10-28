@@ -3,6 +3,11 @@
 
 $ErrorActionPreference = "Stop"
 
+python model_assets.py
+if ($LASTEXITCODE -ne 0) {
+    throw "Offline model validation failed; restore the model before packaging."
+}
+
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host " Starting Proximap Commercial Packaging" -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan

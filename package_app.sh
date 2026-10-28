@@ -4,6 +4,8 @@
 
 set -e
 
+python3 model_assets.py
+
 echo "============================================="
 echo " Starting Proximap Commercial Packaging (macOS)"
 echo "============================================="

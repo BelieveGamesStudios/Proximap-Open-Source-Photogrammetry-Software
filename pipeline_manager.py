@@ -2857,6 +2857,13 @@ class BackgroundRemovalWorker(QThread):
                 alt_models = os.path.join(get_base_dir(), "_internal", "models")
                 if os.path.isdir(alt_models):
                     models_dir = alt_models
+            from model_assets import validate_silueta
+            try:
+                validate_silueta(os.path.join(models_dir, "silueta.onnx"))
+            except ValueError as exc:
+                self.log_message.emit(f"[ERROR] {exc}")
+                self.finished.emit(False, self.image_paths, str(exc))
+                return
             os.environ["U2NET_HOME"] = models_dir
 
             # Guard against PyInstaller environments where package metadata for pymatting or rembg is stripped

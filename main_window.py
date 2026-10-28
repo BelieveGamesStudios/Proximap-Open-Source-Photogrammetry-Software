@@ -1,3 +1,9 @@
+if __name__ == "__main__":
+    # Dependencies can spawn multiprocessing helpers during import. In a
+    # frozen build those helpers must be dispatched before loading the GUI.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
 import os
 import sys
 import subprocess

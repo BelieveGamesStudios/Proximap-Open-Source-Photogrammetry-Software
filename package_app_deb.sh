@@ -4,6 +4,9 @@
 
 set -e
 
+# Fail before cleaning/building if Git LFS left a model placeholder behind.
+python3 model_assets.py
+
 APP_NAME="proximap"
 DISPLAY_NAME="Proximap"
 VERSION="1.5.0"
