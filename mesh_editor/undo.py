@@ -53,7 +53,10 @@ class TransformCommand(BaseCommand):
         self.redo()
 
     def undo(self):
-        for obj, (pos_b, rot_b, scale_b, _, _, _) in self.states.items():
+        for obj, state in self.states.items():
+            pos_b, rot_b, scale_b = state[:3]
+            if len(state) > 6:
+                obj._affine_residual = state[6].copy()
             obj.position = np.copy(pos_b)
             obj.rotation = np.copy(rot_b)
             obj.scale = np.copy(scale_b)
@@ -61,7 +64,10 @@ class TransformCommand(BaseCommand):
             self.viewport.update()
 
     def redo(self):
-        for obj, (_, _, _, pos_a, rot_a, scale_a) in self.states.items():
+        for obj, state in self.states.items():
+            pos_a, rot_a, scale_a = state[3:6]
+            if len(state) > 6:
+                obj._affine_residual = state[7].copy()
             obj.position = np.copy(pos_a)
             obj.rotation = np.copy(rot_a)
             obj.scale = np.copy(scale_a)
@@ -106,48 +112,40 @@ class DeleteCommand(BaseCommand):
         self.viewport = viewport
         self.on_scene_changed_cb = on_scene_changed_cb
         # Store tuples of (object, original_index_in_scene)
-        self.indexed_objects = []
+        self.before = None
+        self.after = None
+
+    def _refresh(self):
+        if self.on_scene_changed_cb:
+            self.on_scene_changed_cb()
+        self.viewport.selection_changed.emit(self.viewport.scene.active_object)
+        self.viewport.update()
 
     def execute(self):
         if not self.viewport:
             return
         scene = self.viewport.scene
-        self.indexed_objects = []
-        for obj in self.objects:
-            if obj in scene.objects:
-                idx = scene.objects.index(obj)
-                self.indexed_objects.append((obj, idx))
-                scene.remove_object(obj)
-        
-        # Clear selection if deleted objects were selected
-        scene.selected_objects = [o for o in scene.selected_objects if o not in self.objects]
-        if scene.active_object in self.objects:
-            scene.active_object = scene.selected_objects[-1] if scene.selected_objects else None
-
-        if self.on_scene_changed_cb:
-            self.on_scene_changed_cb()
-        if self.viewport:
-            self.viewport.selection_changed.emit(scene.active_object)
-            self.viewport.update()
+        if self.after is not None:
+            self.after.restore(scene)
+        else:
+            self.before = SceneState(scene)
+            removed = set(self.objects)
+            for obj in self.objects:
+                removed.update(obj.descendants())
+            for obj in self.objects:
+                if obj.parent not in removed:
+                    obj.set_parent(None)
+            scene.objects = [obj for obj in scene.objects if obj not in removed]
+            scene.selected_objects = [obj for obj in scene.selected_objects if obj not in removed]
+            if scene.active_object in removed:
+                scene.active_object = scene.selected_objects[-1] if scene.selected_objects else None
+            self.after = SceneState(scene)
+        self._refresh()
 
     def undo(self):
-        if not self.viewport:
-            return
-        scene = self.viewport.scene
-        # Re-insert objects at original indices
-        for obj, idx in sorted(self.indexed_objects, key=lambda x: x[1]):
-            if obj not in scene.objects:
-                idx_clamped = min(idx, len(scene.objects))
-                scene.objects.insert(idx_clamped, obj)
-        
-        scene.selected_objects = list(self.objects)
-        scene.active_object = self.objects[-1] if self.objects else None
-
-        if self.on_scene_changed_cb:
-            self.on_scene_changed_cb()
-        if self.viewport:
-            self.viewport.selection_changed.emit(scene.active_object)
-            self.viewport.update()
+        if self.before is not None:
+            self.before.restore(self.viewport.scene)
+            self._refresh()
 
     def redo(self):
         self.execute()
@@ -157,8 +155,9 @@ class AddObjectCommand(BaseCommand):
     """Captures mesh import or creation into the scene."""
     label = "Add Object"
 
-    def __init__(self, objects: list, viewport=None, on_scene_changed_cb=None):
+    def __init__(self, objects: list, viewport=None, on_scene_changed_cb=None, selection=None):
         self.objects = list(objects)
+        self.selection = list(selection) if selection is not None else list(objects)
         self.viewport = viewport
         self.on_scene_changed_cb = on_scene_changed_cb
 
@@ -169,8 +168,8 @@ class AddObjectCommand(BaseCommand):
         for obj in self.objects:
             if obj not in scene.objects:
                 scene.add_object(obj)
-        scene.selected_objects = list(self.objects)
-        scene.active_object = self.objects[-1] if self.objects else None
+        scene.selected_objects = list(self.selection)
+        scene.active_object = self.selection[-1] if self.selection else None
 
         if self.on_scene_changed_cb:
             self.on_scene_changed_cb()
@@ -248,3 +247,55 @@ class UndoStack:
     def clear(self):
         self.undo_stack.clear()
         self.redo_stack.clear()
+
+
+class SceneState:
+    """Small graph snapshot; mesh arrays and GPU buffers are never copied."""
+    def __init__(self, scene):
+        self.objects = list(scene.objects)
+        self.states = {obj: (obj.name, obj.parent, obj.get_local_matrix().copy()) for obj in self.objects}
+        self.children = {obj: list(obj.children) for obj in self.objects}
+        self.selection = list(scene.selected_objects)
+        self.active = scene.active_object
+
+    def restore(self, scene):
+        for obj in set(scene.objects) | set(self.objects):
+            obj.parent = None
+            obj.children = []
+        scene.objects = list(self.objects)
+        for obj, (name, parent, matrix) in self.states.items():
+            obj.name = name
+            obj.parent = parent
+            if parent is not None:
+                parent.children.append(obj)
+            obj.set_local_matrix(matrix)
+        for obj, children in self.children.items():
+            obj.children[:] = children
+        scene.selected_objects = list(self.selection)
+        scene.active_object = self.active
+
+
+class SceneGraphCommand(BaseCommand):
+    """Undo one completed create, rename, or reparent operation atomically."""
+    def __init__(self, label, before, viewport, callback=None):
+        self.label = label
+        self.before = before
+        self.after = SceneState(viewport.scene)
+        self.viewport = viewport
+        self.callback = callback
+
+    def _restore(self, state):
+        state.restore(self.viewport.scene)
+        if self.callback:
+            self.callback()
+        self.viewport.selection_changed.emit(self.viewport.scene.active_object)
+        self.viewport.update()
+
+    def execute(self):
+        self.redo()
+
+    def undo(self):
+        self._restore(self.before)
+
+    def redo(self):
+        self._restore(self.after)

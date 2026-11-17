@@ -231,10 +231,22 @@ class Gizmo:
 
     # ---------------------------------------------------------------- helpers
 
-    def get_scale_factor(self, camera) -> float:
+    def get_scale_factor(self, camera, obj, height: float) -> float:
+        """Keep a unit handle about 90 logical pixels long at the pivot depth.
+
+        Camera.distance describes the orbit target, which can be far from the
+        selected pivot when flying or panning. Use the pivot's camera-space
+        depth so moving toward a selection also shrinks the world-space gizmo.
+        """
         if camera.is_perspective:
-            return camera.distance * 0.16
-        return camera.ortho_scale * 0.16
+            depth = float(np.dot(obj.position - camera.get_position(),
+                                 camera.get_forward_vector()))
+            if depth <= 0:
+                return 0.0
+            view_height = 2.0 * depth * np.tan(np.radians(camera.fov) * 0.5)
+        else:
+            view_height = camera.ortho_scale
+        return float(view_height * 90.0 / max(height, 1.0))
 
     def _obj_r_col(self, obj) -> np.ndarray:
         """Return trimesh column-major rotation matrix from obj.rotation (Euler °)."""
@@ -318,6 +330,10 @@ class Gizmo:
         if obj is None or not self.program:
             return
 
+        sf = self.get_scale_factor(camera, obj, height)
+        if sf <= 0:
+            return
+
         gl.glUseProgram(self.program)
         gl.glDisable(gl.GL_DEPTH_TEST)
         gl.glLineWidth(1.0)
@@ -325,7 +341,6 @@ class Gizmo:
         aspect    = width / max(height, 1.0)
         view_mat  = camera.get_view_matrix()
         proj_mat  = camera.get_projection_matrix(aspect)
-        sf        = self.get_scale_factor(camera)
 
         # Pass view/proj exactly as the object shader does (pyrr → GL_FALSE, no extra transform)
         gl.glUniformMatrix4fv(self._loc["view"], 1, gl.GL_FALSE, view_mat)
@@ -510,7 +525,9 @@ class Gizmo:
         vp_mat   = pyrr.matrix44.multiply(view_mat, proj_mat)
 
         _, _, gizmo_matrix = self.get_gizmo_transforms(obj)
-        sf = self.get_scale_factor(camera)
+        sf = self.get_scale_factor(camera, obj, height)
+        if sf <= 0:
+            return None
 
         center_s = self.project_local_to_screen([0, 0, 0], gizmo_matrix, sf, vp_mat, width, height)
         if center_s is None:
@@ -525,6 +542,12 @@ class Gizmo:
             return np.linalg.norm(M - (A + t * ab))
 
         def in_quad(p, q0, q1, q2, q3):
+            # An edge-on plane has no pickable screen area. Otherwise all
+            # triangle signs can be zero and steal clicks along an entire axis.
+            corners = np.array([q0, q1, q2, q3], dtype=np.float64)
+            x, y = corners[:, 0], corners[:, 1]
+            if abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) < 1.0:
+                return False
             def sgn(a, b, c):
                 return (a[0]-c[0])*(b[1]-c[1]) - (b[0]-c[0])*(a[1]-c[1])
             s = [sgn(p,q0,q1), sgn(p,q1,q2), sgn(p,q2,q3), sgn(p,q3,q0)]
@@ -699,7 +722,7 @@ class Gizmo:
                     obj.position = self._drag_start_pos + dp
 
         elif self.operation == "scale":
-            sf   = self.get_scale_factor(camera)
+            sf   = self.get_scale_factor(camera, obj, height)
             vp2  = vp_mat
             _, _, gmat = self.get_gizmo_transforms(obj)
             c_s  = self.project_local_to_screen([0,0,0], gmat, sf, vp2, width, height)

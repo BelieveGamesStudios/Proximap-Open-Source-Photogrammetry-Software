@@ -2373,7 +2373,7 @@ class SessionRecoveryDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Proximap 1.5.0")
+        self.setWindowTitle("Proximap 1.6.0")
         self.setMinimumSize(1100, 750)
         
         base_dir = get_base_dir()
@@ -9452,6 +9452,8 @@ class MainWindow(QMainWindow):
                 self.canvas.update()
 
     def closeEvent(self, event):
+        if getattr(self, 'mesh_editor_tab', None) is not None:
+            self.mesh_editor_tab.workspace.save_layout()
         self._terminate_viewer()
         if hasattr(self, 'loopback_server') and self.loopback_server:
             try:

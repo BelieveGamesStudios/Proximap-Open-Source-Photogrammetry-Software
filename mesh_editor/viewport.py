@@ -32,6 +32,7 @@ class GizmoPivot:
 class MeshEditorViewport(QOpenGLWidget):
     """3D OpenGL Viewport for Mesh Editing. Integrates camera controls, grid, and ImGuizmo."""
     selection_changed = Signal(object) # Emits the newly selected Object (or None)
+    context_menu_requested = Signal(object)
     transform_changed = Signal(object) # Emits the selected Object when transformed by the gizmo
     transform_committed = Signal(object) # Emits (states_dict, operation_str) tuple when gizmo drag ends
     undo_requested = Signal() # Emits when Ctrl+Z shortcut is pressed
@@ -373,6 +374,8 @@ void main() { fragColor = pickColor; }
         loc_color = gl.glGetUniformLocation(self._pick_program, "pickColor")
 
         for idx, obj in enumerate(self.scene.objects, start=1):
+            if obj.mesh is None:
+                continue
             r, g, b, a = self._id_to_color(idx)
             gl.glUniform4f(loc_color, r, g, b, a)
             gl.glUniformMatrix4fv(loc_model, 1, gl.GL_FALSE, obj.get_model_matrix())
@@ -443,7 +446,14 @@ void main() { fragColor = pickColor; }
             world_max = np.maximum(world_max, omax)
         median_center = (world_min + world_max) * 0.5
         
-        return GizmoPivot(median_center, active_obj.rotation, active_obj.scale)
+        import trimesh
+        _, _, angles, world_position, _ = trimesh.transformations.decompose_matrix(active_obj.get_model_matrix().T)
+        # Empty parents retain their chosen pivot as children are edited.
+        # Mesh imports can have baked, off-origin vertices: keep their gizmos
+        # centered on the visible geometry as before.
+        if len(selected_objs) == 1 and active_obj.mesh is None:
+            median_center = world_position
+        return GizmoPivot(median_center, -np.degrees(angles), np.ones(3, dtype=np.float32))
 
     def paintGL(self):
         # 1. Clear background
@@ -485,11 +495,13 @@ void main() { fragColor = pickColor; }
         
         # Render each object
         for obj in self.scene.objects:
+            if obj.mesh is None:
+                continue
             model_matrix = obj.get_model_matrix()
             gl.glUniformMatrix4fv(gl.glGetUniformLocation(self.object_program, "model"), 1, gl.GL_FALSE, model_matrix)
             
             # Object base color (greyish blue)
-            color = np.array([0.45, 0.55, 0.65], dtype=np.float32)
+            color = obj.mesh.base_color
             gl.glUniform3fv(gl.glGetUniformLocation(self.object_program, "objectColor"), 1, color)
             gl.glUniform1i(gl.glGetUniformLocation(self.object_program, "useOverrideColor"), 0)
             
@@ -498,8 +510,8 @@ void main() { fragColor = pickColor; }
             gl.glUniform1i(gl.glGetUniformLocation(self.object_program, "useTexture"), 1 if has_tex else 0)
             gl.glUniform1i(gl.glGetUniformLocation(self.object_program, "textureSampler"), 0)
             
-            is_selected = obj in self.scene.selected_objects
-            is_active = self.scene.active_object == obj
+            is_selected = obj in self.scene.selected_objects or any(parent in self.scene.selected_objects for parent in obj.ancestors())
+            is_active = self.scene.active_object == obj or self.scene.active_object in obj.ancestors()
             
             # If selected, enable stencil testing to write to the stencil buffer during the standard pass
             if is_selected:
@@ -618,7 +630,8 @@ void main() { fragColor = pickColor; }
             
         # Clean up scene mesh VBOs/VAOs
         for obj in self.scene.objects:
-            obj.mesh.cleanup()
+            if obj.mesh is not None:
+                obj.mesh.cleanup()
 
         # Reset input states
 
@@ -668,8 +681,31 @@ void main() { fragColor = pickColor; }
         event.ignore()
 
     # Event handlers
+    def contextMenuEvent(self, event):
+        # A short RMB release opens the menu; a held/dragged RMB retains fly navigation.
+        event.accept()
+
+    def _apply_gizmo_transform(self):
+        import trimesh
+        origin = trimesh.transformations.translation_matrix(self._drag_start_pivot_pos)
+        if self.gizmo.operation == 'translate':
+            delta = trimesh.transformations.translation_matrix(self._drag_pivot.position - self._drag_start_pivot_pos)
+        elif self.gizmo.operation == 'rotate':
+            rotation = trimesh.transformations.euler_matrix(*np.radians(-self._drag_pivot.rotation), 'sxyz')
+            delta = origin @ rotation @ np.linalg.inv(self._drag_start_pivot_r_mat) @ np.linalg.inv(origin)
+        else:
+            ratio = self._drag_pivot.scale / np.maximum(self._drag_start_pivot_scale, 1e-6)
+            frame = self._drag_start_pivot_r_mat if self.gizmo.space == 'local' else np.eye(4)
+            delta = origin @ frame @ np.diag([*ratio, 1.0]) @ np.linalg.inv(frame) @ np.linalg.inv(origin)
+        # Transform selected roots once. Descendants follow through their parents.
+        for obj, world in self._drag_start_world.items():
+            obj.set_world_matrix(delta @ world)
+
     def mouseMoveEvent(self, event: QMouseEvent):
         pos = event.position()
+        if self.is_fly_navigating and hasattr(self, '_context_press_pos'):
+            if (pos.toPoint() - self._context_press_pos).manhattanLength() > 4:
+                self._context_navigated = True
         dx = pos.x() - self.last_mouse_pos.x()
         dy = pos.y() - self.last_mouse_pos.y()
         if self.invert_y:
@@ -678,34 +714,7 @@ void main() { fragColor = pickColor; }
         if self._gizmo_dragging:
             self.gizmo.update_drag(pos.x(), pos.y(), self._drag_pivot, self.camera, self.width(), self.height())
             
-            # Propagate pivot modifications to all selected objects
-            import trimesh
-            if self.gizmo.operation == "translate":
-                delta_pos = self._drag_pivot.position - self._drag_start_pivot_pos
-                for obj in self.scene.selected_objects:
-                    obj.position = self._drag_start_positions[obj] + delta_pos
-            elif self.gizmo.operation == "scale":
-                ratio = self._drag_pivot.scale / np.maximum(self._drag_start_pivot_scale, 1e-6)
-                for obj in self.scene.selected_objects:
-                    obj.scale = self._drag_start_scales[obj] * ratio
-            elif self.gizmo.operation == "rotate":
-                rx = np.radians(-self._drag_pivot.rotation[0])
-                ry = np.radians(-self._drag_pivot.rotation[1])
-                rz = np.radians(-self._drag_pivot.rotation[2])
-                r_new_pivot = trimesh.transformations.euler_matrix(rx, ry, rz, 'sxyz')
-                
-                # r_delta @ start_pivot_r_mat = r_new_pivot => r_delta = r_new_pivot @ inv(start_pivot_r_mat)
-                r_delta = r_new_pivot @ np.linalg.inv(self._drag_start_pivot_r_mat)
-                R_delta_3x3 = r_delta[:3, :3]
-                
-                for obj in self.scene.selected_objects:
-                    # Rotate position around median pivot start pos
-                    obj.position = self._drag_start_pivot_pos + R_delta_3x3 @ (self._drag_start_positions[obj] - self._drag_start_pivot_pos)
-                    # Rotate orientation matrix
-                    obj_r_new = r_delta @ self._drag_start_r_mats[obj]
-                    ex, ey, ez = trimesh.transformations.euler_from_matrix(obj_r_new, 'sxyz')
-                    obj.rotation = -np.degrees([ex, ey, ez]).astype(np.float32)
-                    
+            self._apply_gizmo_transform()
             self.transform_changed.emit(self.scene.active_object)
             self.update()
         elif self._is_box_selecting:
@@ -780,7 +789,11 @@ void main() { fragColor = pickColor; }
                     rz = np.radians(-pivot.rotation[2])
                     self._drag_start_pivot_r_mat = trimesh.transformations.euler_matrix(rx, ry, rz, 'sxyz')
                     
-                    self._drag_start_positions = {obj: np.copy(obj.position) for obj in self.scene.selected_objects}
+                    from mesh_editor.import_options import selection_roots
+                    roots = selection_roots(self.scene.selected_objects)
+                    self._drag_start_world = {obj: obj.get_model_matrix().T.copy() for obj in roots}
+                    self._drag_start_residuals = {obj: obj._affine_residual.copy() for obj in roots}
+                    self._drag_start_positions = {obj: np.copy(obj.position) for obj in roots}
                     self._drag_start_rotations = {obj: np.copy(obj.rotation) for obj in self.scene.selected_objects}
                     self._drag_start_scales = {obj: np.copy(obj.scale) for obj in self.scene.selected_objects}
                     self._drag_start_r_mats = {}
@@ -796,6 +809,8 @@ void main() { fragColor = pickColor; }
         
         # 2. Handle Right-Click Flythrough Navigation
         if event.button() == Qt.MouseButton.RightButton:
+            self._context_press_pos = pos.toPoint()
+            self._context_navigated = False
             self.is_fly_navigating = True
             self._last_nav_time = time.time()
             if not self._nav_timer.isActive():
@@ -838,11 +853,22 @@ void main() { fragColor = pickColor; }
  
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.RightButton:
+            show_menu = not getattr(self, '_context_navigated', True)
             self.is_fly_navigating = False
             _FLY_KEYS = {Qt.Key.Key_W, Qt.Key.Key_A, Qt.Key.Key_S, Qt.Key.Key_D, Qt.Key.Key_Q, Qt.Key.Key_E}
             self._active_nav_keys.difference_update(_FLY_KEYS)
             if not self._active_nav_keys:
                 self._nav_timer.stop()
+            if show_menu:
+                old_selected = list(self.scene.selected_objects)
+                old_active = self.scene.active_object
+                hit = self._pick_object_at(event.position().x(), event.position().y(), False)
+                if hit in old_selected:
+                    self.scene.selected_objects = old_selected
+                    self.scene.active_object = old_active
+                self.selection_changed.emit(self.scene.active_object)
+                self.update()
+                self.context_menu_requested.emit(event.globalPosition().toPoint())
 
         if self._gizmo_dragging:
             self.gizmo.end_drag()
@@ -858,7 +884,8 @@ void main() { fragColor = pickColor; }
                         rot_a = np.copy(obj.rotation)
                         scale_a = np.copy(obj.scale)
                         if not (np.array_equal(pos_b, pos_a) and np.array_equal(rot_b, rot_a) and np.array_equal(scale_b, scale_a)):
-                            states[obj] = (pos_b, rot_b, scale_b, pos_a, rot_a, scale_a)
+                            states[obj] = (pos_b, rot_b, scale_b, pos_a, rot_a, scale_a,
+                                           self._drag_start_residuals[obj], obj._affine_residual.copy())
                 if states:
                     self.transform_committed.emit((states, self.gizmo.operation))
             self.update()
@@ -925,6 +952,8 @@ void main() { fragColor = pickColor; }
         
         if key in _NAV_KEYS or (self.is_fly_navigating and key in _FLY_KEYS):
             self._active_nav_keys.add(key)
+            if self.is_fly_navigating:
+                self._context_navigated = True
             if not self._nav_timer.isActive():
                 self._last_nav_time = time.time()
                 self._nav_timer.start()

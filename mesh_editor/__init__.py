@@ -4,15 +4,15 @@ from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel, QScrollArea,
     QListWidget, QGridLayout, QDoubleSpinBox, QCheckBox, QPushButton,
     QColorDialog, QComboBox, QFileDialog, QMessageBox, QDialog, QProgressBar,
-    QMenuBar, QMenu, QWidgetAction
+    QMenuBar, QMenu, QWidgetAction, QSizePolicy, QInputDialog
 )
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtGui import QColor, QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent, QDropEvent, QIcon
 from mesh_editor.viewport import MeshEditorViewport
 from mesh_editor.scene import Object, load_mesh_file, apply_texture_to_meshes
 from mesh_editor.undo import (
     UndoStack, BaseCommand, TransformCommand, SpinboxTransformCommand,
-    DeleteCommand, AddObjectCommand
+    DeleteCommand, AddObjectCommand, SceneState, SceneGraphCommand
 )
 from addon_manager import AddonManager
 from preferences_dialog import PreferencesDialog
@@ -22,16 +22,21 @@ class MeshImportWorker(QThread):
     # Signals: finished (success, meshes, error_message)
     finished = Signal(bool, list, str)
     
-    def __init__(self, file_path: str, texture_path: str = None):
+    def __init__(self, file_path: str, texture_path: str = None, meshes=None, assignments=None):
         super().__init__()
         self.file_path = file_path
         self.texture_path = texture_path
+        self.meshes = meshes
+        self.assignments = assignments
         
     def run(self):
         try:
             # Load mesh in the worker thread (heavy CPU task)
-            meshes = load_mesh_file(self.file_path)
-            if self.texture_path:
+            meshes = self.meshes if self.meshes is not None else load_mesh_file(self.file_path)
+            if self.assignments is not None:
+                from mesh_editor.import_options import apply_assignments
+                apply_assignments(meshes, self.assignments)
+            elif self.texture_path:
                 apply_texture_to_meshes(meshes, self.texture_path)
             self.finished.emit(True, meshes, "")
         except Exception as e:
@@ -155,8 +160,8 @@ class CollapsibleAddonPanel(QFrame):
             self.btn_toggle.setStyleSheet("""
                 QPushButton {
                     font-weight: bold;
-                    font-size: 12px;
-                    color: #00E676;
+                    font-size: 11px;
+                    color: #cccccc;
                     text-align: left;
                     background-color: #1A1A1A;
                     border: none;
@@ -164,10 +169,10 @@ class CollapsibleAddonPanel(QFrame):
                     border-top-right-radius: 5px;
                     border-bottom-left-radius: 0px;
                     border-bottom-right-radius: 0px;
-                    padding: 8px 10px;
+                    padding: 5px 8px;
                 }
                 QPushButton:hover {
-                    color: #66FFA6;
+                    color: #eeeeee;
                     background-color: #242424;
                 }
             """)
@@ -175,16 +180,16 @@ class CollapsibleAddonPanel(QFrame):
             self.btn_toggle.setStyleSheet("""
                 QPushButton {
                     font-weight: bold;
-                    font-size: 12px;
-                    color: #00E676;
+                    font-size: 11px;
+                    color: #cccccc;
                     text-align: left;
                     background-color: #1A1A1A;
                     border: none;
                     border-radius: 5px;
-                    padding: 8px 10px;
+                    padding: 5px 8px;
                 }
                 QPushButton:hover {
-                    color: #66FFA6;
+                    color: #eeeeee;
                     background-color: #242424;
                 }
             """)
@@ -231,305 +236,85 @@ class MeshEditorWidget(QWidget):
 
 
     def _init_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(15)
-        
-        # --- LEFT PANEL: Sidebar Controls ---
-        self.sidebar = QFrame(self)
-        self.sidebar.setObjectName("Sidebar")
-        self.sidebar.setFixedWidth(360)
-        sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(0)
-        
-        # Header/Title of Mesh Editor sidebar
-        title_container = QWidget(self.sidebar)
-        title_container.setStyleSheet("background-color: #1A1A1A; border-top-left-radius: 8px; border-top-right-radius: 8px;")
-        title_layout = QVBoxLayout(title_container)
-        title_layout.setContentsMargins(20, 20, 20, 10)
-        
-        title_label = QLabel("Mesh Editor controls", title_container)
-        title_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #ffffff; padding-bottom: 10px; border-bottom: 1px solid #3d3d3d;")
-        title_layout.addWidget(title_label)
-        sidebar_layout.addWidget(title_container)
-        
-        # Scroll area for controls
-        scroll_area = QScrollArea(self.sidebar)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll_area.setStyleSheet("QScrollArea { background-color: #1A1A1A; border: none; }")
-        
-        scroll_content = QWidget()
-        scroll_content.setObjectName("ScrollContent")
-        scroll_content.setStyleSheet("QWidget#ScrollContent { background-color: #1A1A1A; }")
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(20, 10, 20, 20)
-        scroll_layout.setSpacing(20)
-        
-        # SECTION 1: Outliner
-        outliner_box = QFrame(scroll_content)
-        outliner_box.setObjectName("StepBox")
-        outliner_vlayout = QVBoxLayout(outliner_box)
-        
-        outliner_title = QLabel("Scene Outliner", outliner_box)
-        outliner_title.setStyleSheet("font-weight: bold; font-size: 14px; color: #00E676;")
-        outliner_vlayout.addWidget(outliner_title)
-        
-        self.outliner_list = QListWidget(outliner_box)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.outliner_panel = QWidget(self)
+        outliner_layout = QVBoxLayout(self.outliner_panel)
+        outliner_layout.setContentsMargins(6, 6, 6, 6)
+        outliner_layout.setSpacing(6)
+        from mesh_editor.outliner import SceneOutliner
+        self.outliner_list = SceneOutliner()
         self.outliner_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.outliner_list.setMinimumHeight(120)
-        self.outliner_list.setStyleSheet("""
-            QListWidget {
-                background-color: #121212;
-                border: 1px solid #333333;
-                border-radius: 4px;
-                color: #e0e0e0;
-                padding: 5px;
-            }
-            QListWidget::item:selected {
-                background-color: #00E676;
-                color: #121212;
-            }
-        """)
-        outliner_vlayout.addWidget(self.outliner_list)
-        
-        # Actions for Scene Outliner (only Delete Selected button)
-        self.btn_delete_mesh = QPushButton("Delete Selected", outliner_box)
-        self.btn_delete_mesh.setStyleSheet("""
-            QPushButton {
-                font-size: 11px;
-                padding: 6px;
-                background-color: #331A1A;
-                color: #FF5252;
-                border: 1px solid #FF5252;
-                border-radius: 4px;
-                margin-top: 5px;
-            }
-            QPushButton:hover {
-                background-color: #FF5252;
-                color: #ffffff;
-            }
-            QPushButton:disabled {
-                background-color: #222222;
-                color: #666666;
-                border: 1px solid #333333;
-            }
-        """)
+        self.outliner_list.setMinimumHeight(80)
+        outliner_layout.addWidget(self.outliner_list)
+        self.btn_delete_mesh = QPushButton("Delete Selected")
         self.btn_delete_mesh.setEnabled(False)
-        outliner_vlayout.addWidget(self.btn_delete_mesh)
-        
-        scroll_layout.addWidget(outliner_box, stretch=1)
-        
-        # SECTION 2: Transform Properties
-        self.properties_box = QFrame(scroll_content)
-        self.properties_box.setObjectName("StepBox")
-        properties_vlayout = QVBoxLayout(self.properties_box)
-        
-        properties_title = QLabel("Transform Properties", self.properties_box)
-        properties_title.setStyleSheet("font-weight: bold; font-size: 14px; color: #00E676;")
-        properties_vlayout.addWidget(properties_title)
-        
-        grid_layout = QGridLayout()
-        grid_layout.setSpacing(6)
-        
-        # Helper function to create standard spinboxes
+        outliner_layout.addWidget(self.btn_delete_mesh)
+
+        self.properties_box = QFrame(self)
+        properties_layout = QVBoxLayout(self.properties_box)
+        properties_layout.setContentsMargins(10, 10, 10, 10)
+        properties_layout.setSpacing(8)
+        self.selection_hint = QLabel("Select an object to edit its transform")
+        self.selection_hint.setWordWrap(True)
+        properties_layout.addWidget(self.selection_hint)
+        properties_layout.addWidget(QLabel("Transform"))
+
         def create_spinbox(min_val=-1000.0, max_val=1000.0, step=0.1):
             sb = QDoubleSpinBox()
             sb.setRange(min_val, max_val)
             sb.setSingleStep(step)
             sb.setDecimals(3)
-            sb.setStyleSheet("""
-                QDoubleSpinBox {
-                    background-color: #333333;
-                    color: #ffffff;
-                    border: 1px solid #444444;
-                    border-radius: 4px;
-                    padding: 4px;
-                    padding-right: 20px; /* Make room for standard arrow buttons */
-                }
-                QDoubleSpinBox::up-button {
-                    subcontrol-origin: border;
-                    subcontrol-position: top right;
-                    width: 18px;
-                    border-left: 1px solid #444444;
-                    border-bottom: 1px solid #222222;
-                    border-top-right-radius: 4px;
-                    background-color: #2D2D2D;
-                }
-                QDoubleSpinBox::up-button:hover {
-                    background-color: #3D3D3D;
-                }
-                QDoubleSpinBox::up-button:pressed {
-                    background-color: #00E676;
-                }
-                QDoubleSpinBox::up-arrow {
-                    image: url(no-image);
-                    width: 0;
-                    height: 0;
-                    border-left: 3px solid transparent;
-                    border-right: 3px solid transparent;
-                    border-bottom: 5px solid #ffffff;
-                }
-                QDoubleSpinBox::up-arrow:pressed {
-                    border-bottom-color: #121212;
-                }
-                QDoubleSpinBox::down-button {
-                    subcontrol-origin: border;
-                    subcontrol-position: bottom right;
-                    width: 18px;
-                    border-left: 1px solid #444444;
-                    border-bottom-right-radius: 4px;
-                    background-color: #2D2D2D;
-                }
-                QDoubleSpinBox::down-button:hover {
-                    background-color: #3D3D3D;
-                }
-                QDoubleSpinBox::down-button:pressed {
-                    background-color: #00E676;
-                }
-                QDoubleSpinBox::down-arrow {
-                    image: url(no-image);
-                    width: 0;
-                    height: 0;
-                    border-left: 3px solid transparent;
-                    border-right: 3px solid transparent;
-                    border-top: 5px solid #ffffff;
-                }
-                QDoubleSpinBox::down-arrow:pressed {
-                    border-top-color: #121212;
-                }
-            """)
+            sb.setMinimumWidth(60)
+            sb.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
             return sb
-            
-        lbl_style = "color: #aaaaaa; font-weight: bold;"
-        hdr_style = "color: #00E676; font-weight: bold; font-size: 11px; margin-top: 5px;"
-        
-        # Location Group
-        lbl_loc_hdr = QLabel("Location", self.properties_box)
-        lbl_loc_hdr.setStyleSheet(hdr_style)
-        grid_layout.addWidget(lbl_loc_hdr, 0, 0, 1, 2)
-        
-        lbl_x = QLabel("X", self.properties_box)
-        lbl_x.setStyleSheet(lbl_style)
-        self.sp_pos_x = create_spinbox()
-        grid_layout.addWidget(lbl_x, 1, 0)
-        grid_layout.addWidget(self.sp_pos_x, 1, 1)
-        
-        lbl_y = QLabel("Y", self.properties_box)
-        lbl_y.setStyleSheet(lbl_style)
-        self.sp_pos_y = create_spinbox()
-        grid_layout.addWidget(lbl_y, 2, 0)
-        grid_layout.addWidget(self.sp_pos_y, 2, 1)
-        
-        lbl_z = QLabel("Z", self.properties_box)
-        lbl_z.setStyleSheet(lbl_style)
-        self.sp_pos_z = create_spinbox()
-        grid_layout.addWidget(lbl_z, 3, 0)
-        grid_layout.addWidget(self.sp_pos_z, 3, 1)
-        
-        # Rotation Group
-        lbl_rot_hdr = QLabel("Rotation (Deg)", self.properties_box)
-        lbl_rot_hdr.setStyleSheet(hdr_style)
-        grid_layout.addWidget(lbl_rot_hdr, 4, 0, 1, 2)
-        
-        lbl_rx = QLabel("X", self.properties_box)
-        lbl_rx.setStyleSheet(lbl_style)
-        self.sp_rot_x = create_spinbox(-360.0, 360.0, 5.0)
-        grid_layout.addWidget(lbl_rx, 5, 0)
-        grid_layout.addWidget(self.sp_rot_x, 5, 1)
-        
-        lbl_ry = QLabel("Y", self.properties_box)
-        lbl_ry.setStyleSheet(lbl_style)
-        self.sp_rot_y = create_spinbox(-360.0, 360.0, 5.0)
-        grid_layout.addWidget(lbl_ry, 6, 0)
-        grid_layout.addWidget(self.sp_rot_y, 6, 1)
-        
-        lbl_rz = QLabel("Z", self.properties_box)
-        lbl_rz.setStyleSheet(lbl_style)
-        self.sp_rot_z = create_spinbox(-360.0, 360.0, 5.0)
-        grid_layout.addWidget(lbl_rz, 7, 0)
-        grid_layout.addWidget(self.sp_rot_z, 7, 1)
-        
-        # Scale Group
-        lbl_scl_hdr = QLabel("Scale", self.properties_box)
-        lbl_scl_hdr.setStyleSheet(hdr_style)
-        grid_layout.addWidget(lbl_scl_hdr, 8, 0, 1, 2)
-        
-        lbl_sx = QLabel("X", self.properties_box)
-        lbl_sx.setStyleSheet(lbl_style)
-        self.sp_scale_x = create_spinbox(0.01, 100.0, 0.1)
-        grid_layout.addWidget(lbl_sx, 9, 0)
-        grid_layout.addWidget(self.sp_scale_x, 9, 1)
-        
-        lbl_sy = QLabel("Y", self.properties_box)
-        lbl_sy.setStyleSheet(lbl_style)
-        self.sp_scale_y = create_spinbox(0.01, 100.0, 0.1)
-        grid_layout.addWidget(lbl_sy, 10, 0)
-        grid_layout.addWidget(self.sp_scale_y, 10, 1)
-        
-        lbl_sz = QLabel("Z", self.properties_box)
-        lbl_sz.setStyleSheet(lbl_style)
-        self.sp_scale_z = create_spinbox(0.01, 100.0, 0.1)
-        grid_layout.addWidget(lbl_sz, 11, 0)
-        grid_layout.addWidget(self.sp_scale_z, 11, 1)
-        
-        properties_vlayout.addLayout(grid_layout)
-        scroll_layout.addWidget(self.properties_box, stretch=0)
-        
-        # SECTION 3: Add-on Tools Container (Expandable & Collapsible)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(6)
+        for column, axis in enumerate("XYZ", 1):
+            label = QLabel(axis)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(label, 0, column)
+            grid.setColumnStretch(column, 1)
+        for row, (name, prefix, limits, default) in enumerate([
+            ("Location", "pos", (-1000.0, 1000.0, 0.1), 0.0),
+            ("Rotation", "rot", (-360.0, 360.0, 5.0), 0.0),
+            ("Scale", "scale", (0.01, 100.0, 0.1), 1.0),
+        ], 1):
+            grid.addWidget(QLabel(name), row, 0)
+            for column, axis in enumerate("xyz", 1):
+                spinbox = create_spinbox(*limits)
+                spinbox.setValue(default)
+                spinbox.setToolTip(f"{name} {axis.upper()}" + (" (degrees)" if prefix == "rot" else ""))
+                spinbox.setAccessibleName(f"{name} {axis.upper()}")
+                setattr(self, f"sp_{prefix}_{axis}", spinbox)
+                grid.addWidget(spinbox, row, column)
+        properties_layout.addLayout(grid)
+        properties_layout.addStretch()
+
         self._is_addon_section_expanded = True
-        self.addon_box = QFrame(scroll_content)
-        self.addon_box.setObjectName("StepBox")
-        addon_vlayout = QVBoxLayout(self.addon_box)
-        addon_vlayout.setContentsMargins(10, 10, 10, 10)
-        addon_vlayout.setSpacing(6)
-        
-        # Collapsible header trigger button
-        self.btn_addon_toggle = QPushButton("▼  Add-on Tools", self.addon_box)
-        self.btn_addon_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_addon_toggle.setStyleSheet("""
-            QPushButton {
-                font-weight: bold;
-                font-size: 14px;
-                color: #00E676;
-                text-align: left;
-                background-color: transparent;
-                border: none;
-                padding: 2px 0px;
-            }
-            QPushButton:hover {
-                color: #66FFA6;
-            }
-        """)
+        self.addon_box = QFrame(self)
+        addon_layout = QVBoxLayout(self.addon_box)
+        addon_layout.setContentsMargins(6, 6, 6, 6)
+        self.btn_addon_toggle = QPushButton("▼  Add-on Tools")
         self.btn_addon_toggle.clicked.connect(self._toggle_addon_section)
-        addon_vlayout.addWidget(self.btn_addon_toggle)
-        
+        addon_layout.addWidget(self.btn_addon_toggle)
         self.addon_container = QWidget(self.addon_box)
         self.addon_container_layout = QVBoxLayout(self.addon_container)
         self.addon_container_layout.setContentsMargins(0, 4, 0, 0)
         self.addon_container_layout.setSpacing(6)
-        addon_vlayout.addWidget(self.addon_container)
-        
-        scroll_layout.addWidget(self.addon_box, stretch=0)
-        self.update_addon_panels()
+        addon_layout.addWidget(self.addon_container)
 
-        
-        scroll_area.setWidget(scroll_content)
-        sidebar_layout.addWidget(scroll_area)
-        layout.addWidget(self.sidebar)
-        
         # Create Settings widgets for the View dropdown menu
         self.btn_projection = QPushButton("Camera: Perspective")
-        self.btn_projection.setStyleSheet("QPushButton { font-size: 11px; padding: 6px 12px; }")
         
         self.cb_snap = QCheckBox("Enable Snapping")
-        self.cb_snap.setStyleSheet("color: #ffffff; font-size: 11px;")
         
         self.cb_invert_y = QCheckBox("Invert Y Mouse")
-        self.cb_invert_y.setStyleSheet("color: #ffffff; font-size: 11px;")
         
         # Snapping options
         self.sp_snap_t = create_spinbox(0.01, 10.0, 0.1)
@@ -544,9 +329,7 @@ class MeshEditorWidget(QWidget):
         
         # Color pickers
         self.btn_color_bg = QPushButton("Background Color")
-        self.btn_color_bg.setStyleSheet("QPushButton { font-size: 11px; padding: 6px 12px; }")
         self.btn_color_grid = QPushButton("Grid Major Color")
-        self.btn_color_grid.setStyleSheet("QPushButton { font-size: 11px; padding: 6px 12px; }")
         
         # --- RIGHT PANEL: Viewport Container with Top Toolbar ---
         self.viewport_container = QWidget(self)
@@ -558,6 +341,7 @@ class MeshEditorWidget(QWidget):
         # Create Menu Bar / Toolbar
         self.menu_bar = QMenuBar(self.viewport_container)
         self.menu_bar.setObjectName("ViewportMenuBar")
+        self.menu_bar.setNativeMenuBar(False)
         
         # 1. File Menu
         file_menu = QMenu("File", self.menu_bar)
@@ -621,13 +405,11 @@ class MeshEditorWidget(QWidget):
         view_menu = QMenu("View", self.menu_bar)
         
         settings_widget = QWidget(view_menu)
-        settings_widget.setStyleSheet("background-color: #1A1A1A; color: #ffffff;")
         settings_layout = QVBoxLayout(settings_widget)
         settings_layout.setContentsMargins(15, 12, 15, 12)
         settings_layout.setSpacing(10)
         
         lbl_title = QLabel("Viewport Settings", settings_widget)
-        lbl_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #00E676; padding-bottom: 4px; border-bottom: 1px solid #333333;")
         settings_layout.addWidget(lbl_title)
         
         settings_layout.addWidget(self.btn_projection)
@@ -639,17 +421,14 @@ class MeshEditorWidget(QWidget):
         snap_grid.setSpacing(6)
         
         lbl_tsnap = QLabel("T-Snap (m):", settings_widget)
-        lbl_tsnap.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         snap_grid.addWidget(lbl_tsnap, 0, 0)
         snap_grid.addWidget(self.sp_snap_t, 0, 1)
         
         lbl_rsnap = QLabel("R-Snap (deg):", settings_widget)
-        lbl_rsnap.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         snap_grid.addWidget(lbl_rsnap, 1, 0)
         snap_grid.addWidget(self.sp_snap_r, 1, 1)
         
         lbl_subdiv = QLabel("Grid Subdivs:", settings_widget)
-        lbl_subdiv.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         snap_grid.addWidget(lbl_subdiv, 2, 0)
         snap_grid.addWidget(self.sp_subdivs, 2, 1)
         
@@ -666,46 +445,18 @@ class MeshEditorWidget(QWidget):
         
         self.menu_bar.addMenu(view_menu)
         
-        viewport_layout.addWidget(self.menu_bar)
         
         # Horizontal layout for the toolbar and the viewport
         viewport_hbox = QHBoxLayout()
         viewport_hbox.setContentsMargins(0, 0, 0, 0)
         viewport_hbox.setSpacing(0)
         
-        # Create Vertical Toolbar Frame
+        # Horizontal tools centered in the workspace header
         self.trans_toolbar = QFrame(self.viewport_container)
         self.trans_toolbar.setObjectName("ViewportToolbar")
-        self.trans_toolbar.setFixedWidth(42)
-        self.trans_toolbar.setStyleSheet("""
-            QFrame#ViewportToolbar {
-                background-color: #1A1A1A;
-                border-right: 1px solid #2D2D2D;
-            }
-            QPushButton {
-                background-color: transparent;
-                color: #aaaaaa;
-                border: 1px solid transparent;
-                border-radius: 4px;
-                font-size: 16px;
-                font-weight: bold;
-                margin: 4px;
-                padding: 6px;
-            }
-            QPushButton:hover {
-                background-color: #2D2D2D;
-                color: #ffffff;
-                border: 1px solid #444444;
-            }
-            QPushButton:checked {
-                background-color: #00E676;
-                color: #121212;
-                border: 1px solid #00E676;
-            }
-        """)
         
-        toolbar_layout = QVBoxLayout(self.trans_toolbar)
-        toolbar_layout.setContentsMargins(0, 4, 0, 4)
+        toolbar_layout = QHBoxLayout(self.trans_toolbar)
+        toolbar_layout.setContentsMargins(0, 2, 0, 2)
         toolbar_layout.setSpacing(4)
         
         from PySide6.QtWidgets import QButtonGroup
@@ -713,7 +464,7 @@ class MeshEditorWidget(QWidget):
         self.tool_group.setExclusive(True)
         
         # Translate Tool Button
-        self.btn_tool_translate = QPushButton("✥", self.trans_toolbar)
+        self.btn_tool_translate = QPushButton(self.trans_toolbar)
         self.btn_tool_translate.setCheckable(True)
         self.btn_tool_translate.setChecked(True)
         self.btn_tool_translate.setToolTip("Translate (G)")
@@ -721,22 +472,32 @@ class MeshEditorWidget(QWidget):
         toolbar_layout.addWidget(self.btn_tool_translate)
         
         # Rotate Tool Button
-        self.btn_tool_rotate = QPushButton("⟳", self.trans_toolbar)
+        self.btn_tool_rotate = QPushButton(self.trans_toolbar)
         self.btn_tool_rotate.setCheckable(True)
         self.btn_tool_rotate.setToolTip("Rotate (R)")
         self.tool_group.addButton(self.btn_tool_rotate)
         toolbar_layout.addWidget(self.btn_tool_rotate)
         
         # Scale Tool Button
-        self.btn_tool_scale = QPushButton("⤢", self.trans_toolbar)
+        self.btn_tool_scale = QPushButton(self.trans_toolbar)
         self.btn_tool_scale.setCheckable(True)
         self.btn_tool_scale.setToolTip("Scale (S)")
         self.tool_group.addButton(self.btn_tool_scale)
         toolbar_layout.addWidget(self.btn_tool_scale)
+
+        public_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'public')
+        for button, filename, name in (
+            (self.btn_tool_translate, 'position.svg', 'Translate'),
+            (self.btn_tool_rotate, 'rotation.svg', 'Rotate'),
+            (self.btn_tool_scale, 'scale.svg', 'Scale'),
+        ):
+            button.setIcon(QIcon(os.path.join(public_dir, filename)))
+            button.setIconSize(QSize(20, 20))
+            button.setAccessibleName(name)
         
         # Separator line
         line = QFrame(self.trans_toolbar)
-        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShape(QFrame.Shape.VLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         line.setStyleSheet("background-color: #333333; margin: 4px;")
         toolbar_layout.addWidget(line)
@@ -744,27 +505,11 @@ class MeshEditorWidget(QWidget):
         # Space Toggle Button (Defaults to Global)
         self.btn_tool_space = QPushButton("Global", self.trans_toolbar)
         self.btn_tool_space.setToolTip("Transform Space: Global (Click to toggle)")
-        self.btn_tool_space.setStyleSheet("""
-            QPushButton {
-                font-size: 10px;
-                font-weight: bold;
-                padding: 6px 2px;
-                background-color: #2D2D2D;
-                color: #ffffff;
-                border: 1px solid #444444;
-                border-radius: 4px;
-                margin: 4px;
-            }
-            QPushButton:hover {
-                background-color: #3D3D3D;
-                border-color: #ffffff;
-            }
-        """)
         toolbar_layout.addWidget(self.btn_tool_space)
         
         # Separator line
         line2 = QFrame(self.trans_toolbar)
-        line2.setFrameShape(QFrame.Shape.HLine)
+        line2.setFrameShape(QFrame.Shape.VLine)
         line2.setFrameShadow(QFrame.Shadow.Sunken)
         line2.setStyleSheet("background-color: #333333; margin: 4px;")
         toolbar_layout.addWidget(line2)
@@ -774,41 +519,31 @@ class MeshEditorWidget(QWidget):
         self.btn_projection_toolbar.setCheckable(True)
         self.btn_projection_toolbar.setChecked(True)
         self.btn_projection_toolbar.setToolTip("Toggle Perspective/Orthographic (Numpad 5)")
-        self.btn_projection_toolbar.setStyleSheet("""
-            QPushButton {
-                font-size: 9px;
-                font-weight: bold;
-                padding: 6px 2px;
-                background-color: #2D2D2D;
-                color: #ffffff;
-                border: 1px solid #444444;
-                border-radius: 4px;
-                margin: 4px;
-            }
-            QPushButton:hover {
-                background-color: #3D3D3D;
-            }
-            QPushButton:checked {
-                background-color: #00E676;
-                color: #121212;
-                border-color: #00E676;
-            }
-        """)
         toolbar_layout.addWidget(self.btn_projection_toolbar)
 
-        toolbar_layout.addStretch()
         
-        viewport_hbox.addWidget(self.trans_toolbar)
         
         self.viewport = MeshEditorViewport(self)
         viewport_hbox.addWidget(self.viewport, stretch=1)
         viewport_layout.addLayout(viewport_hbox)
         
-        layout.addWidget(self.viewport_container, stretch=1)
+        from mesh_editor.workspace import EditorHeader, MeshEditorWorkspace
+        self.workspace = MeshEditorWorkspace(self)
+        self.editor_header = EditorHeader(self.menu_bar, self.trans_toolbar)
+        self.workspace.setMenuWidget(self.editor_header)
+        self.workspace.setCentralWidget(self.viewport_container)
+        self.workspace.add_panels(self.outliner_panel, self.properties_box,
+                                  self.addon_box)
+        self.workspace.populate_view_menu(view_menu)
+        layout.addWidget(self.workspace)
+        # The editor has its own scoped theme, independent of reconstruction UI.
+        from mesh_editor.workspace import EDITOR_STYLE
+        self.setStyleSheet(EDITOR_STYLE)
+        self.trans_toolbar.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         
         # Disable properties inputs initially until an object is selected
         self._set_properties_enabled(False)
-        self.properties_box.setVisible(False)
+        self.properties_box.setVisible(True)
 
     def get_outliner_widget(self):
         return self.outliner_list
@@ -831,6 +566,9 @@ class MeshEditorWidget(QWidget):
         
         # 3. Sidebar Selection -> Sync Viewport Selection
         self.outliner_list.itemSelectionChanged.connect(self._on_outliner_selection_changed)
+        self.outliner_list.customContextMenuRequested.connect(self._outliner_context_menu)
+        self.outliner_list.move_requested.connect(self._on_outliner_drop)
+        self.viewport.context_menu_requested.connect(self._show_object_context_menu)
         
         # 4. Spinbox value changes -> Sync Viewport Object Transform & Commit Undo
         for sb in [self.sp_pos_x, self.sp_pos_y, self.sp_pos_z]:
@@ -875,13 +613,11 @@ class MeshEditorWidget(QWidget):
         self.viewport.tool_changed.connect(self._on_viewport_tool_changed)
 
     def _populate_outliner(self):
-        self.outliner_list.blockSignals(True)
-        self.outliner_list.clear()
-        for obj in self.viewport.scene.objects:
-            self.outliner_list.addItem(obj.name)
-        self.outliner_list.blockSignals(False)
+        self.outliner_list.rebuild(self.viewport.scene)
 
     def _set_properties_enabled(self, enabled: bool):
+        obj = self.active_object
+        self.selection_hint.setText(obj.name if enabled and obj else "Select an object to edit its transform")
         for sb in [
             self.sp_pos_x, self.sp_pos_y, self.sp_pos_z,
             self.sp_rot_x, self.sp_rot_y, self.sp_rot_z,
@@ -900,34 +636,9 @@ class MeshEditorWidget(QWidget):
     # --- SLOT HANDLERS ---
     def _update_outliner_highlights(self):
         self.outliner_list.blockSignals(True)
-        active_obj = self.viewport.scene.active_object
-        selected_objs = self.viewport.scene.selected_objects
-        
-        for i in range(self.outliner_list.count()):
-            item = self.outliner_list.item(i)
-            item_name = item.text()
-            
-            obj = None
-            for o in self.viewport.scene.objects:
-                if o.name == item_name:
-                    obj = o
-                    break
-                    
-            if obj in selected_objs:
-                item.setSelected(True)
-                if obj == active_obj:
-                    # Active object (last clicked): Bright Green text, darker green/black background
-                    item.setForeground(QColor("#00FF9C"))
-                    item.setBackground(QColor("#1e2d27"))
-                else:
-                    # Secondary selected: Muted green text, subtle background
-                    item.setForeground(QColor("#1A7A4A"))
-                    item.setBackground(QColor("#121b16"))
-            else:
-                item.setSelected(False)
-                item.setForeground(QColor("#e0e0e0"))
-                item.setBackground(QColor("#121212"))
-                
+        for obj, item in self.outliner_list.items_by_object.items():
+            item.setSelected(obj in self.selected_objects)
+            item.setForeground(0, QColor('#a8ebc5' if obj is self.active_object else '#cccccc'))
         self.outliner_list.blockSignals(False)
 
     # --- SLOT HANDLERS ---
@@ -940,7 +651,7 @@ class MeshEditorWidget(QWidget):
             self.outliner_list.clearSelection()
             self.outliner_list.blockSignals(False)
             self._set_properties_enabled(False)
-            self.properties_box.setVisible(False)
+            self.properties_box.setVisible(True)
             self._block_properties_signals(True)
             for sb in [self.sp_pos_x, self.sp_pos_y, self.sp_pos_z, self.sp_rot_x, self.sp_rot_y, self.sp_rot_z]:
                 sb.setValue(0.0)
@@ -967,47 +678,100 @@ class MeshEditorWidget(QWidget):
             self._sync_properties_from_object(obj)
 
     def _on_outliner_selection_changed(self):
-        selected_items = self.outliner_list.selectedItems()
-        if not selected_items:
-            self.viewport.scene.selected_objects = []
-            self.viewport.scene.active_object = None
-            active_obj = None
-        else:
-            new_selected = []
-            for item in selected_items:
-                for obj in self.viewport.scene.objects:
-                    if obj.name == item.text():
-                        new_selected.append(obj)
-                        break
-            self.viewport.scene.selected_objects = new_selected
-            
-            current_item = self.outliner_list.currentItem()
-            active_obj = None
-            if current_item and current_item.isSelected():
-                for obj in self.viewport.scene.objects:
-                    if obj.name == current_item.text():
-                        active_obj = obj
-                        break
-            if active_obj is None and new_selected:
-                active_obj = new_selected[-1]
-            self.viewport.scene.active_object = active_obj
-            
-        selected_objs = self.viewport.scene.selected_objects
-        self.btn_delete_mesh.setEnabled(len(selected_objs) > 0)
-        
-        if active_obj is None:
-            self._set_properties_enabled(False)
-            self.properties_box.setVisible(False)
-        else:
-            self._set_properties_enabled(True)
-            self.properties_box.setVisible(True)
-            self._sync_properties_from_object(active_obj)
-            
-        self._update_outliner_highlights()
+        selected = [self.outliner_list.object_for(item) for item in self.outliner_list.selectedItems()]
+        active = self.outliner_list.object_for(self.outliner_list.currentItem())
+        self.viewport.scene.selected_objects = selected
+        self.viewport.scene.active_object = active if active in selected else (selected[-1] if selected else None)
+        self.viewport.selection_changed.emit(self.active_object)
         self.viewport.update()
 
-        # Emit selection signals so viewport listeners (addons) and MeshEditorWidget subscribers receive callback
-        self.viewport.selection_changed.emit(active_obj)
+    def _outliner_context_menu(self, point):
+        item = self.outliner_list.itemAt(point)
+        if item is None:
+            self.outliner_list.clearSelection()
+        elif not item.isSelected():
+            self.outliner_list.clearSelection()
+            self.outliner_list.setCurrentItem(item)
+            item.setSelected(True)
+        self._show_object_context_menu(self.outliner_list.viewport().mapToGlobal(point))
+
+    def _on_outliner_drop(self, payload):
+        objects, parent, before_sibling = payload
+        before = SceneState(self.viewport.scene)
+        try:
+            changed = self.viewport.scene.move_objects(objects, parent, before_sibling)
+        except (ValueError, np.linalg.LinAlgError):
+            before.restore(self.viewport.scene)
+            self._populate_outliner()
+            return
+        if changed:
+            self._commit_scene_edit('Move Objects', before)
+            if parent in self.outliner_list.items_by_object:
+                self.outliner_list.items_by_object[parent].setExpanded(True)
+
+    def _build_object_context_menu(self):
+        menu = QMenu(self)
+        selection = list(self.selected_objects)
+        delete = menu.addAction('Delete')
+        delete.setEnabled(bool(selection))
+        delete.triggered.connect(self._delete_selected_object)
+        rename = menu.addAction('Rename')
+        rename.setEnabled(len(selection) == 1)
+        rename.triggered.connect(self._rename_selected_object)
+        menu.addSeparator()
+        parent = menu.addAction('Create Parent Object')
+        parent.setEnabled(bool(selection))
+        parent.triggered.connect(self._create_parent_object)
+        menu.addAction('Create Empty Object', self._create_empty_object)
+        return menu
+
+    def _show_object_context_menu(self, global_point):
+        menu = self._build_object_context_menu()
+        menu.exec(global_point)
+        menu.deleteLater()
+
+    def _unique_object_name(self, name):
+        names = {obj.name for obj in self.viewport.scene.objects}
+        candidate, index = name, 1
+        while candidate in names:
+            candidate = f'{name} ({index})'
+            index += 1
+        return candidate
+
+    def _commit_scene_edit(self, label, before):
+        self.push_command(SceneGraphCommand(label, before, self.viewport, self._populate_outliner))
+        self._populate_outliner()
+        self.viewport.selection_changed.emit(self.active_object)
+        self.viewport.update()
+
+    def _create_parent_object(self):
+        if not self.selected_objects:
+            return
+        from mesh_editor.import_options import group_objects
+        before = SceneState(self.viewport.scene)
+        parent = group_objects(self.selected_objects, self._unique_object_name('Parent'))
+        self.viewport.scene.add_object(parent)
+        self.viewport.scene.selected_objects = [parent]
+        self.viewport.scene.active_object = parent
+        self._commit_scene_edit('Create Parent', before)
+
+    def _create_empty_object(self):
+        before = SceneState(self.viewport.scene)
+        obj = Object(self._unique_object_name('Empty'), None)
+        self.viewport.scene.add_object(obj)
+        self.viewport.scene.selected_objects = [obj]
+        self.viewport.scene.active_object = obj
+        self._commit_scene_edit('Create Empty', before)
+
+    def _rename_selected_object(self):
+        if len(self.selected_objects) != 1:
+            return
+        obj = self.selected_objects[0]
+        name, accepted = QInputDialog.getText(self, 'Rename Object', 'Name', text=obj.name)
+        if accepted and name.strip() and name.strip() != obj.name:
+            before = SceneState(self.viewport.scene)
+            obj.name = self._unique_object_name(name.strip())
+            self._commit_scene_edit('Rename', before)
 
     def push_command(self, cmd: BaseCommand):
         """Public API for registering custom commands into the Undo/Redo stack (supports addons)."""
@@ -1180,72 +944,30 @@ class MeshEditorWidget(QWidget):
             self.viewport.grid_color_1 = np.array([r, g, b, a], dtype=np.float32)
             self.viewport.update()
 
-    def _import_mesh_from_path(self, file_path: str, texture_path: str = None):
+    def _import_mesh_from_path(self, file_path: str, texture_path=None):
         if not file_path or not os.path.exists(file_path):
-            QMessageBox.critical(
-                self, "Import Error", f"Model file not found:\n{file_path}"
-            )
+            QMessageBox.critical(self, 'Import Error', f'Model file not found:\n{file_path}')
             return
-            
-        # Display modal dialog
+        from mesh_editor.import_dialog import ModelImportDialog
+        paths = ([texture_path] if isinstance(texture_path, str) else texture_path) or []
+        options = ModelImportDialog(file_path, self, paths)
+        if options.exec() != QDialog.DialogCode.Accepted:
+            options.deleteLater()
+            return
+        self._import_group = options.group.isChecked()
+        assignments = dict(options.assignments) if options.texture_mode.currentIndex() == 1 else None
         self.import_dialog = MeshImportProgressDialog(self)
-        
-        # Setup worker thread
-        self.import_worker = MeshImportWorker(file_path, texture_path)
+        self.import_worker = MeshImportWorker(file_path, meshes=options.meshes, assignments=assignments)
         self.import_worker.finished.connect(self._on_import_finished)
-        
-        # Start worker thread and dialog
+        options.deleteLater()
         self.import_worker.start()
         self.import_dialog.exec()
 
     def _on_import_model_clicked(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Import 3D Model", "", "3D Mesh Files (*.obj *.glb *.gltf *.ply)"
-        )
-        if not file_path:
-            return
-            
-        # Check if the model has an auto-detectable texture
-        has_texture = False
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext in ('.glb', '.gltf'):
-            has_texture = True
-        elif ext == '.obj':
-            mtl_path = os.path.splitext(file_path)[0] + '.mtl'
-            if os.path.exists(mtl_path):
-                try:
-                    with open(mtl_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        for line in f:
-                            if line.strip().startswith('map_Kd'):
-                                has_texture = True
-                                break
-                except Exception:
-                    pass
-                    
-        if not has_texture:
-            reply = QMessageBox.question(
-                self,
-                "Select Texture File",
-                "This model does not appear to have an embedded or associated texture map.\n\n"
-                "Would you like to select a companion texture file (e.g., .png, .jpg, .mtl)?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                selected_paths, _ = QFileDialog.getOpenFileNames(
-                    self,
-                    "Select Texture / Material File(s)",
-                    os.path.dirname(file_path),
-                    "Texture & Material Files (*.png *.jpg *.jpeg *.bmp *.tga *.mtl)"
-                )
-                if selected_paths:
-                    mtl_files = [p for p in selected_paths if p.lower().endswith('.mtl')]
-                    img_files = [p for p in selected_paths if not p.lower().endswith('.mtl')]
-                    texture_path = mtl_files[0] if mtl_files else img_files[0]
-                    self._import_mesh_from_path(file_path, texture_path)
-                    return
-                    
-        self._import_mesh_from_path(file_path)
+        file_path, _ = QFileDialog.getOpenFileName(self, 'Import 3D Model', '',
+            '3D Mesh Files (*.obj *.glb *.gltf *.ply)')
+        if file_path:
+            self._import_mesh_from_path(file_path)
 
     def _on_load_reconstructed_model_clicked(self):
         # Traverse up parent to find active mvs_dir
@@ -1363,38 +1085,26 @@ class MeshEditorWidget(QWidget):
             # 2. Setup OpenGL buffers on the main thread with context active
             self.viewport.makeCurrent()
             file_path = self.import_worker.file_path
-            base_file_name = os.path.basename(file_path)
-            existing_names = [o.name for o in self.viewport.scene.objects]
-            
-            created_objects = []
-            for node_name, mesh in meshes:
-                mesh.setup_buffers()
-                
-                # Prefer geometry's own node name, fallback to base file name
-                name = node_name if node_name else base_file_name
-                unique_name = name
-                idx = 1
-                while unique_name in existing_names:
-                    unique_name = f"{name} ({idx})"
-                    idx += 1
-                existing_names.append(unique_name)
-                
-                obj = Object(unique_name, mesh)
-                self.viewport.scene.add_object(obj)
-                created_objects.append(obj)
-                
-            self.viewport.doneCurrent()
-            
-            # 3. Refresh outliner list
+            from mesh_editor.import_options import build_import_objects
+            created_objects, active = build_import_objects(meshes, file_path,
+                group=getattr(self, '_import_group', True),
+                existing_names=[obj.name for obj in self.viewport.scene.objects])
+            try:
+                for obj in created_objects:
+                    if obj.mesh is not None:
+                        obj.mesh.setup_buffers()
+            finally:
+                self.viewport.doneCurrent()
+            cmd = AddObjectCommand(created_objects, self.viewport, on_scene_changed_cb=self._populate_outliner,
+                                   selection=[active] if active is not None else [])
+            cmd.execute()
+            if active is not None:
+                self.viewport.scene.selected_objects = [active]
+                self.viewport.scene.active_object = active
             self._populate_outliner()
-            
-            # 4. Select the last created object (or first) and push Undo command
-            if created_objects:
-                self.viewport.scene.selected_object = created_objects[-1]
-                self._on_viewport_selection_changed(created_objects[-1])
-                cmd = AddObjectCommand(created_objects, self.viewport, on_scene_changed_cb=self._populate_outliner)
-                self.push_command(cmd)
-                
+            self.viewport.selection_changed.emit(active)
+            self.push_command(cmd)
+
             # 5. Update rendering
             self.viewport.update()
             
@@ -1513,42 +1223,10 @@ class MeshEditorWidget(QWidget):
             gizmo.space = "global"
             self.btn_tool_space.setText("Global")
             self.btn_tool_space.setToolTip("Transform Space: Global (Click to toggle)")
-            self.btn_tool_space.setStyleSheet("""
-                QPushButton {
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 6px 2px;
-                    background-color: #2D2D2D;
-                    color: #ffffff;
-                    border: 1px solid #444444;
-                    border-radius: 4px;
-                    margin: 4px;
-                }
-                QPushButton:hover {
-                    background-color: #3D3D3D;
-                    border-color: #ffffff;
-                }
-            """)
         else:
             gizmo.space = "local"
             self.btn_tool_space.setText("Local")
             self.btn_tool_space.setToolTip("Transform Space: Local (Click to toggle)")
-            self.btn_tool_space.setStyleSheet("""
-                QPushButton {
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 6px 2px;
-                    background-color: #2D2D2D;
-                    color: #00E676;
-                    border: 1px solid #444444;
-                    border-radius: 4px;
-                    margin: 4px;
-                }
-                QPushButton:hover {
-                    background-color: #3D3D3D;
-                    border-color: #00E676;
-                }
-            """)
         self.viewport.update()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -1607,64 +1285,7 @@ class MeshEditorWidget(QWidget):
         # Handle mesh files drop
         if mesh_files:
             for mesh_file in mesh_files:
-                # Find matching companion texture if dropped together
-                companion_texture = None
-                mesh_name = os.path.splitext(os.path.basename(mesh_file))[0].lower()
-                
-                # Check for exact name match (ignoring extensions)
-                for tex in texture_files:
-                    tex_name = os.path.splitext(os.path.basename(tex))[0].lower()
-                    if tex_name == mesh_name:
-                        companion_texture = tex
-                        break
-                
-                # If no exact name match, but exactly one texture file was dropped, use it
-                if companion_texture is None and len(texture_files) == 1:
-                    companion_texture = texture_files[0]
-                    
-                if companion_texture:
-                    self._import_mesh_from_path(mesh_file, companion_texture)
-                else:
-                    # No companion texture found, use standard prompt (which does auto-detect check internally)
-                    has_texture = False
-                    ext = os.path.splitext(mesh_file)[1].lower()
-                    if ext in ('.glb', '.gltf'):
-                        has_texture = True
-                    elif ext == '.obj':
-                        mtl_path = os.path.splitext(mesh_file)[0] + '.mtl'
-                        if os.path.exists(mtl_path):
-                            try:
-                                with open(mtl_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                    for line in f:
-                                        if line.strip().startswith('map_Kd'):
-                                            has_texture = True
-                                            break
-                            except Exception:
-                                pass
-                                
-                    if not has_texture:
-                        reply = QMessageBox.question(
-                            self,
-                            "Select Texture File",
-                            f"Model '{os.path.basename(mesh_file)}' does not appear to have an embedded or associated texture map.\n\n"
-                            "Would you like to select a companion texture file (e.g., .png, .jpg, .mtl)?",
-                            QMessageBox.Yes | QMessageBox.No,
-                            QMessageBox.No
-                        )
-                        if reply == QMessageBox.Yes:
-                            selected_paths, _ = QFileDialog.getOpenFileNames(
-                                self,
-                                "Select Texture / Material File(s)",
-                                os.path.dirname(mesh_file),
-                                "Texture & Material Files (*.png *.jpg *.jpeg *.bmp *.tga *.mtl)"
-                            )
-                            if selected_paths:
-                                mtl_files = [p for p in selected_paths if p.lower().endswith('.mtl')]
-                                img_files = [p for p in selected_paths if not p.lower().endswith('.mtl')]
-                                texture_path = mtl_files[0] if mtl_files else img_files[0]
-                                self._import_mesh_from_path(mesh_file, texture_path)
-                                continue
-                    self._import_mesh_from_path(mesh_file)
+                self._import_mesh_from_path(mesh_file, texture_files)
             event.acceptProposedAction()
         else:
             event.ignore()

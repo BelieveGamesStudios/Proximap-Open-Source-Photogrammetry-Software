@@ -108,6 +108,13 @@ class CombinedTransformGizmo:
         # 4. Center Pivot Marker
         self.pivot_marker = scene.visuals.Markers(parent=self.parent_scene)
 
+        # Draw handles after scene geometry, including models loaded later.
+        # Ignoring scene depth keeps every handle visible through the model;
+        # disabling depth writes prevents the overlay from affecting the scene.
+        for visual in (self.trans_lines, self.trans_heads, self.rot_lines, self.pivot_marker):
+            visual.order = 1000
+            visual.set_gl_state('translucent', depth_test=False, depth_mask=False)
+
         self._update_geometry()
         self.set_visible(self.visible)
 

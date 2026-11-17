@@ -170,6 +170,9 @@ class Mesh:
         
         # PIL Image or None
         self.texture_data = texture_data
+        self.base_color = np.array([0.45, 0.55, 0.65], dtype=np.float32)
+        self.material_name = "Material"
+        self.source_hierarchy = ()
         
         # Local space Axis-Aligned Bounding Box (AABB)
         self.local_aabb_min = np.array(local_aabb_min, dtype=np.float32)
@@ -292,6 +295,9 @@ class Object:
     def __init__(self, name: str, mesh: Mesh):
         self.name = name
         self.mesh = mesh
+        self.parent = None
+        self.children = []
+        self._affine_residual = np.eye(4)
         
         # Transform properties
         self.position = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -299,37 +305,68 @@ class Object:
         self.rotation = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.scale = np.array([1.0, 1.0, 1.0], dtype=np.float32)
 
-    def get_model_matrix(self) -> np.ndarray:
+    def get_local_matrix(self):
         import trimesh
-        rx = np.radians(-self.rotation[0])
-        ry = np.radians(-self.rotation[1])
-        rz = np.radians(-self.rotation[2])
-        
-        t_mat = trimesh.transformations.translation_matrix(self.position)
-        r_mat = trimesh.transformations.euler_matrix(rx, ry, rz, 'sxyz')
-        s_mat = np.diag([self.scale[0], self.scale[1], self.scale[2], 1.0])
-        
-        # Column-major transformation: T * R * S
-        col_major = t_mat @ r_mat @ s_mat
-        
-        # Return row-major (transpose) for rendering/shader compatibility
-        return col_major.T.astype(np.float32)
+        rotation = trimesh.transformations.euler_matrix(*np.radians(-self.rotation), 'sxyz')
+        return (trimesh.transformations.translation_matrix(self.position) @ rotation
+                @ np.diag([*self.scale, 1.0]) @ self._affine_residual)
+
+    def get_model_matrix(self) -> np.ndarray:
+        world = self.get_local_matrix()
+        if self.parent is not None:
+            world = self.parent.get_model_matrix().T @ world
+        return world.T.astype(np.float32)
+
+    def set_local_matrix(self, matrix):
+        import trimesh
+        scale, _, angles, position, _ = trimesh.transformations.decompose_matrix(matrix)
+        self.position = np.asarray(position, dtype=np.float32)
+        self.rotation = -np.degrees(angles).astype(np.float32)
+        self.scale = np.asarray(scale, dtype=np.float32)
+        self._affine_residual = np.eye(4)
+        # Retain affine shear when reparenting under rotated nonuniform scales.
+        self._affine_residual = np.linalg.inv(self.get_local_matrix()) @ matrix
+
+    def set_world_matrix(self, matrix):
+        local = np.asarray(matrix, dtype=np.float64)
+        if self.parent is not None:
+            local = np.linalg.inv(self.parent.get_model_matrix().T) @ local
+        self.set_local_matrix(local)
+
+    def ancestors(self):
+        node = self.parent
+        while node is not None:
+            yield node
+            node = node.parent
+
+    def descendants(self):
+        for child in self.children:
+            yield child
+            yield from child.descendants()
+
+    def set_parent(self, parent, preserve_world=True):
+        if parent is self or (parent is not None and self in parent.ancestors()):
+            raise ValueError("An object cannot be parented to itself or its descendants.")
+        world = self.get_model_matrix().T.copy()
+        if self.parent is not None:
+            self.parent.children.remove(self)
+        self.parent = parent
+        if parent is not None:
+            parent.children.append(self)
+        if preserve_world:
+            self.set_world_matrix(world)
 
     def get_outline_model_matrix(self, scale_factor: float) -> np.ndarray:
-        import trimesh
-        rx = np.radians(-self.rotation[0])
-        ry = np.radians(-self.rotation[1])
-        rz = np.radians(-self.rotation[2])
-        
-        t_mat = trimesh.transformations.translation_matrix(self.position)
-        r_mat = trimesh.transformations.euler_matrix(rx, ry, rz, 'sxyz')
-        s_mat = np.diag([self.scale[0] * scale_factor, self.scale[1] * scale_factor, self.scale[2] * scale_factor, 1.0])
-        
-        col_major = t_mat @ r_mat @ s_mat
-        return col_major.T.astype(np.float32)
+        return (self.get_model_matrix().T @ np.diag([scale_factor]*3 + [1.0])).T.astype(np.float32)
 
     def get_world_aabb(self) -> tuple:
         """Computes the world-space bounding box by transforming the local AABB."""
+        if self.mesh is None:
+            if self.children:
+                bounds = [child.get_world_aabb() for child in self.children]
+                return np.min([b[0] for b in bounds], axis=0), np.max([b[1] for b in bounds], axis=0)
+            point = self.get_model_matrix()[3, :3].copy()
+            return point, point.copy()
         model_mat = self.get_model_matrix()
         local_min = self.mesh.local_aabb_min
         local_max = self.mesh.local_aabb_max
@@ -353,6 +390,10 @@ class Object:
         world_corners = np.array(world_corners)
         world_min = np.min(world_corners, axis=0)
         world_max = np.max(world_corners, axis=0)
+        for child in self.children:
+            child_min, child_max = child.get_world_aabb()
+            world_min = np.minimum(world_min, child_min)
+            world_max = np.maximum(world_max, child_max)
         return world_min, world_max
 
 
@@ -478,6 +519,68 @@ class Scene:
     def add_object(self, obj: Object):
         self.objects.append(obj)
 
+    def move_objects(self, objects, parent=None, before=None):
+        """Reparent/reorder scene roots atomically, preserving world transforms.
+
+        `before` is a sibling insertion anchor; None appends to the destination.
+        Selecting a parent and its descendant only moves the selected parent.
+        """
+        from mesh_editor.import_options import selection_roots
+        objects = list(dict.fromkeys(objects))
+        if not objects:
+            return False
+        if any(obj not in self.objects for obj in objects):
+            raise ValueError('Only objects in this scene can be moved.')
+        roots = selection_roots(objects)
+        if parent is not None:
+            if parent not in self.objects:
+                raise ValueError('The destination parent is not in this scene.')
+            if parent in roots or any(obj in parent.ancestors() for obj in roots):
+                raise ValueError('An object cannot be parented to itself or its descendants.')
+            if abs(np.linalg.det(parent.get_model_matrix().T)) < 1e-12:
+                raise ValueError('Cannot parent under an object with a zero scale.')
+        siblings = list(parent.children) if parent is not None else [obj for obj in self.objects if obj.parent is None]
+        if before is not None and before not in siblings:
+            raise ValueError('The insertion target is not a sibling in the destination.')
+        remaining = [obj for obj in siblings if obj not in roots]
+        if before is None:
+            index = len(remaining)
+        else:
+            # Dropping before a selected sibling uses its next unmoved sibling.
+            following = next((obj for obj in siblings[siblings.index(before):] if obj not in roots), None)
+            index = remaining.index(following) if following is not None else len(remaining)
+        ordered = remaining[:index] + roots + remaining[index:]
+        if siblings == ordered and all(obj.parent is parent for obj in roots):
+            return False
+        # Prepare all destination transforms before changing any relationships.
+        # A failed decomposition must never leave a multi-object move half done.
+        inverse_parent = np.linalg.inv(parent.get_model_matrix().T) if parent is not None else np.eye(4)
+        prepared = {}
+        for obj in roots:
+            if obj.parent is not parent:
+                transform = Object('', None)
+                transform.set_local_matrix(inverse_parent @ obj.get_model_matrix().T)
+                prepared[obj] = transform
+        for obj, transform in prepared.items():
+            obj.set_parent(parent, preserve_world=False)
+            obj.position = transform.position.copy()
+            obj.rotation = transform.rotation.copy()
+            obj.scale = transform.scale.copy()
+            obj._affine_residual = transform._affine_residual.copy()
+        if parent is not None:
+            parent.children[:] = ordered
+        root_order = ordered if parent is None else [obj for obj in self.objects if obj.parent is None]
+        # Keep a deterministic preorder for rendering, export, and tree rebuilds.
+        flattened = []
+        def visit(obj):
+            flattened.append(obj)
+            for child in obj.children:
+                visit(child)
+        for obj in root_order:
+            visit(obj)
+        self.objects[:] = flattened
+        return True
+
     def remove_object(self, obj: Object):
         if obj in self.objects:
             self.objects.remove(obj)
@@ -542,6 +645,8 @@ class Scene:
 
         # 4. Ray-AABB intersection for each object
         for obj in self.objects:
+            if obj.mesh is None:
+                continue
             bounds_min, bounds_max = obj.get_world_aabb()
 
             # --- Screen-space pre-rejection: skip objects whose projected AABB
@@ -642,6 +747,8 @@ class Scene:
 
         newly_selected = []
         for obj in self.objects:
+            if obj.mesh is None:
+                continue
             local_min = obj.mesh.local_aabb_min
             local_max = obj.mesh.local_aabb_max
             corners = [
@@ -825,8 +932,23 @@ def load_mesh_file(file_path: str) -> list[tuple[str, Mesh]]:
     else:
         named_geoms = [(None, mesh_data)]  # single mesh, no node name
 
-    results = []
+    split_geoms = []
     for node_name, geom in named_geoms:
+        material = getattr(geom.visual, 'material', None)
+        materials = getattr(material, 'materials', None)
+        face_materials = getattr(geom.visual, 'face_materials', None)
+        if materials and face_materials is not None:
+            for index, mat in enumerate(materials):
+                faces = np.flatnonzero(np.asarray(face_materials) == index)
+                if not len(faces):
+                    continue
+                part = geom.submesh([faces], append=True)
+                part.visual.material = mat
+                split_geoms.append((node_name, part))
+        else:
+            split_geoms.append((node_name, geom))
+    results = []
+    for node_name, geom in split_geoms:
         vertices = geom.vertices.astype(np.float32)
         indices = geom.faces.astype(np.uint32)
 
@@ -884,6 +1006,25 @@ def load_mesh_file(file_path: str) -> list[tuple[str, Mesh]]:
             texcoords.flatten() if texcoords is not None else None, 
             texture_data
         )
+        if mesh.texture_data is not None:
+            mesh.texture_data = mesh.texture_data.copy()
+        mat = getattr(geom.visual, 'material', None)
+        mesh.material_name = str(getattr(mat, 'name', None) or node_name or "Material")
+        color = getattr(mat, 'baseColorFactor', None)
+        if color is None:
+            color = getattr(mat, 'diffuse', None)
+        if color is None and getattr(geom.visual, 'kind', None) in ('face', 'vertex'):
+            color = geom.visual.main_color
+        if color is not None:
+            color = np.asarray(color, dtype=np.float32)[:3]
+            mesh.base_color = color / 255.0 if np.max(color) > 1 else color
+        if isinstance(mesh_data, trimesh.Scene) and node_name is not None:
+            path = []
+            node = mesh_data.graph.transforms.parents.get(node_name)
+            while node is not None and node != mesh_data.graph.base_frame:
+                path.insert(0, str(node))
+                node = mesh_data.graph.transforms.parents.get(node)
+            mesh.source_hierarchy = tuple(path)
         results.append((node_name, mesh))
 
     return results
@@ -908,6 +1049,8 @@ def export_scene_to_file(scene, file_path: str, pipeline_native_coords: bool = T
     export_scene = trimesh.Scene()
     
     for obj in scene.objects:
+        if obj.mesh is None:
+            continue
         vertices = obj.mesh.vertices.reshape(-1, 3)
         faces = obj.mesh.indices.reshape(-1, 3)
         
@@ -955,8 +1098,12 @@ def export_scene_to_file(scene, file_path: str, pipeline_native_coords: bool = T
                 material=trimesh.visual.material.SimpleMaterial(image=obj.mesh.texture_data)
             )
             
+        if obj.mesh.texture_data is None:
+            t_mesh.visual.face_colors = np.rint(np.r_[obj.mesh.base_color, 1.0] * 255).astype(np.uint8)
         export_scene.add_geometry(t_mesh, node_name=obj.name)
         
+    if not export_scene.geometry:
+        raise ValueError("No mesh geometry in the scene to export.")
     # Export to chosen format (Scene supports glb, gltf, obj)
     if file_path.lower().endswith(".usdz"):
         merged = trimesh.util.concatenate(list(export_scene.geometry.values()))

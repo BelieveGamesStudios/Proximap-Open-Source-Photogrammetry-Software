@@ -9,7 +9,7 @@ python3 model_assets.py
 
 APP_NAME="proximap"
 DISPLAY_NAME="Proximap"
-VERSION="1.5.0"
+VERSION="1.6.0"
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
 MAINTAINER="ProximaXR Spatial Technologies <fumz@proximaxr.space>"
 DESCRIPTION="Intuitive desktop 3D photogrammetry app."

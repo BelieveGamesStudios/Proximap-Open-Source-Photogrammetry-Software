@@ -215,7 +215,7 @@ class MeshInspectorCard(QFrame):
                 font-size: 10px;
             }
             QLabel#HeaderTitle {
-                color: #00E676;
+                color: #CCCCCC;
                 font-weight: bold;
                 font-size: 10px;
                 letter-spacing: 0.5px;
@@ -293,7 +293,12 @@ class MeshInspectorCard(QFrame):
         min_bound = np.array([float('inf'), float('inf'), float('inf')])
         max_bound = np.array([float('-inf'), float('-inf'), float('-inf')])
 
+        expanded = []
         for obj in selected_objs:
+            for node in [obj, *list(obj.descendants() if hasattr(obj, 'descendants') else [])]:
+                if node not in expanded:
+                    expanded.append(node)
+        for obj in expanded:
             # Case 1: Proximap Scene Object with obj.mesh
             if hasattr(obj, "mesh") and obj.mesh is not None:
                 mesh = obj.mesh
