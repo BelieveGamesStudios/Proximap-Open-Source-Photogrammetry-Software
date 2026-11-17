@@ -36,7 +36,8 @@ Optimized for Apple Silicon (M1/M2/M3) and compatible with Intel Macs on macOS 1
  Proximap/
  ├── main_window.py          # PySide6 desktop GUI entry point
  ├── pipeline_manager.py     # Multi-stage photogrammetry pipeline coordinator
- ├── hardware_profiler.py    # Hardware checker (RAM and CUDA detection)
+ ├── hardware_profiler.py    # Memory budgeting and acceleration discovery
+ ├── acceleration.py         # Device inventory, tool capabilities, stage planning
  │
  ├── package_app.ps1         # PowerShell automated build and compilation pipeline
  ├── installer.nsi           # NSIS Setup Wizard installer configuration
@@ -52,7 +53,7 @@ Optimized for Apple Silicon (M1/M2/M3) and compatible with Intel Macs on macOS 1
  
  ### 1. Prerequisites
  * **Python**: Version 3.9 or higher (64-bit recommended).
- * **GPU (Optional but Recommended)**: NVIDIA GPU with CUDA drivers installed for GPU-accelerated mesh refinement and densification.
+ * **GPU (Optional)**: Available acceleration depends on the GPU, its driver/runtime, and the installed reconstruction tools. The selector lists usable devices and shows which stages use CPU. Auto selects one GPU for the run; unsupported stages use CPU. See [acceleration setup](docs/hardware-acceleration.md).
  
  ### 2. Installation
  Clone the repository and install dependencies:

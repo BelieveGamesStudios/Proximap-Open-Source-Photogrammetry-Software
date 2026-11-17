@@ -46,6 +46,9 @@ fi
 if [ -f "toolchain_map.json" ]; then
     cp toolchain_map.json dist/Proximap/
 fi
+if [ -f "toolchain_capabilities.json" ]; then
+    cp toolchain_capabilities.json dist/Proximap/
+fi
 
 # Prune Windows and macOS binary artifacts from Linux snap payload
 find dist/Proximap/backend_bin -type f \( -name "*.exe" -o -name "*.dll" -o -name "*.bat" -o -name "*.pdb" -o -name "*.lib" -o -name "*.dylib" \) -delete 2>/dev/null || true

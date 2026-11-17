@@ -6,6 +6,12 @@ if __name__ == "__main__":
 
 import os
 import sys
+if __name__ == "__main__" and "--acceleration-inventory" in sys.argv:
+    from acceleration import _print_inventory
+    _inventory_arg = sys.argv.index("--acceleration-inventory")
+    _print_inventory(output_path=sys.argv[_inventory_arg + 1])
+    raise SystemExit(0)
+
 import subprocess
 import ctypes
 import json
@@ -185,6 +191,7 @@ from PySide6.QtCore import Qt, QSize, Signal, QTimer, QThread, QRectF
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QFont, QWindow, QPixmap, QImage, QPainter, QColor, QPen
 
 import hardware_profiler
+from acceleration import AccelerationProfile, normalize_selection
 
 
 # Deferred imports for faster startup: MeshEditorWidget, PipelineWorker, BackgroundRemovalWorker
@@ -2384,7 +2391,7 @@ class MainWindow(QMainWindow):
         # Load hardware properties
         self.total_ram_gb = hardware_profiler.get_total_memory() / (1024**3)
         self.available_ram_gb = hardware_profiler.get_available_memory() / (1024**3)
-        self.dgpu_detected = not hardware_profiler.use_low_hardware_fallback
+        self.acceleration_profile = getattr(hardware_profiler, "acceleration_profile", None) or AccelerationProfile()
         
         # Initialize VisPy Canvas & Visual references
         self.canvas = None
@@ -2662,11 +2669,17 @@ class MainWindow(QMainWindow):
         
         self.gpu_label = QLabel("Hardware Acceleration:", step2_box)
         self.gpu_combo = QComboBox(step2_box)
-        self.gpu_combo.addItems([
-            "Auto-Detect",
-            "Force GPU (CUDA)",
-            "Force CPU Fallback"
-        ])
+        for label, selection in self.acceleration_profile.options():
+            self.gpu_combo.addItem(label, selection)
+        diagnostics = "\n".join(self.acceleration_profile.diagnostics)
+        self.gpu_combo.setToolTip(diagnostics)
+        self.acceleration_details = QLabel(step2_box)
+        self.acceleration_details.setTextFormat(Qt.PlainText)
+        self.acceleration_details.setWordWrap(True)
+        self.acceleration_details.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.acceleration_details.setToolTip(diagnostics)
+        self.gpu_combo.currentIndexChanged.connect(self._update_acceleration_selection)
+        self._update_acceleration_selection()
         
         self.auto_cleanup_checkbox = QCheckBox("Auto Cleanup", step2_box)
         self.auto_cleanup_checkbox.setChecked(False)
@@ -3011,6 +3024,7 @@ class MainWindow(QMainWindow):
         step2_layout.addWidget(self.quality_combo)
         step2_layout.addWidget(self.gpu_label)
         step2_layout.addWidget(self.gpu_combo)
+        step2_layout.addWidget(self.acceleration_details)
         step2_layout.addWidget(self.auto_cleanup_checkbox)
         step2_layout.addWidget(self.manhattan_align_checkbox)
 
@@ -3579,6 +3593,29 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QTimer.singleShot(100, self._load_mesh_editor)
 
+    def _selected_acceleration_badge(self):
+        selection = self.gpu_combo.currentData() if hasattr(self, "gpu_combo") else "auto"
+        plan = self.acceleration_profile.resolve(selection)
+        return f"Planned GPU: {plan.device.name}" if plan.device else "Planned acceleration: CPU"
+
+    def _update_acceleration_selection(self, _index=None):
+        self.acceleration_details.setText(
+            self.acceleration_profile.describe(self.gpu_combo.currentData())
+        )
+        if hasattr(self, "badge"):
+            self._update_system_badge()
+
+    def _restore_acceleration_selection(self, value):
+        selection = normalize_selection(value)
+        idx = self.gpu_combo.findData(selection)
+        if idx >= 0:
+            self.gpu_combo.setCurrentIndex(idx)
+        else:
+            self.gpu_combo.setCurrentIndex(self.gpu_combo.findData("cpu"))
+            message = "Saved GPU is unavailable with the installed tools. CPU selected; choose an available GPU to change it."
+            self.console_text.append(f"[ACCELERATION] {message}")
+            self.status_label.setText(message)
+
     def _update_system_badge(self):
         """Calculates system resource quality badge and updates style dynamically."""
         try:
@@ -3600,7 +3637,7 @@ class MainWindow(QMainWindow):
                 badge_color = "#D50000"  # Deep red
                 text_color = "#ffffff"
                 
-            gpu_info = "dGPU Active" if self.dgpu_detected else "iGPU Fallback Active"
+            gpu_info = self._selected_acceleration_badge()
             if swap_used > 1.5 and swap_total > 0:
                 gpu_info += f" · Swap: {swap_used:.1f}/{swap_total:.1f}GB"
                 
@@ -3611,7 +3648,7 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             # Fallback if profiler not fully ready
-            self.badge.setText(f"SYSTEM READY\n{'dGPU Active' if self.dgpu_detected else 'iGPU Fallback Active'}")
+            self.badge.setText(f"SYSTEM READY\n{self._selected_acceleration_badge()}")
             self.badge.setStyleSheet(
                 "background-color: #00E676; color: #121212; "
                 "font-weight: bold; border-radius: 4px; padding: 6px; font-size: 11px;"
@@ -4666,6 +4703,7 @@ class MainWindow(QMainWindow):
         self.quality_combo.setVisible(False)
         self.gpu_label.setVisible(False)
         self.gpu_combo.setVisible(False)
+        self.acceleration_details.setVisible(False)
         if hasattr(self, 'recon_mode_combo'):
             self.recon_mode_combo.setVisible(False)
         if hasattr(self, 'auto_cleanup_row'):
@@ -4704,6 +4742,7 @@ class MainWindow(QMainWindow):
         self.quality_combo.setVisible(True)
         self.gpu_label.setVisible(True)
         self.gpu_combo.setVisible(True)
+        self.acceleration_details.setVisible(True)
         if hasattr(self, 'recon_mode_combo'):
             self.recon_mode_combo.setVisible(True)
             self._on_recon_mode_changed(self.recon_mode_combo.currentIndex())
@@ -4877,7 +4916,7 @@ class MainWindow(QMainWindow):
                 "last_completed_step": "images_imported",
                 "image_count": len(staged),
                 "quality_preset": self.quality_combo.currentText().lower(),
-                "gpu_mode": self.gpu_combo.currentText().lower(),
+                "gpu_mode": self.gpu_combo.currentData(),
                 "has_plain_surfaces": (self.mapper_combo.currentIndex() == 1) if hasattr(self, 'mapper_combo') else False,
                 "auto_cleanup": self.mc_enabled.isChecked() if hasattr(self, 'mc_enabled') else self.auto_cleanup_checkbox.isChecked(),
                 "cleanup_params": {
@@ -5206,10 +5245,9 @@ class MainWindow(QMainWindow):
 
         # Extract quality, gpu mode, and mapper mode
         quality_presets = ["preview", "medium", "high", "ultra"]
-        gpu_modes = ["auto", "force_gpu", "force_cpu"]
         mapper_modes = ["incremental", "global"]
         quality_preset = quality_presets[self.quality_combo.currentIndex()]
-        gpu_mode = gpu_modes[self.gpu_combo.currentIndex()]
+        gpu_mode = self.gpu_combo.currentData()
         mapper_mode = mapper_modes[self.mapper_combo.currentIndex()]
         has_plain = (self.mapper_combo.currentIndex() == 1) if hasattr(self, 'mapper_combo') else False
         auto_cleanup = self.mc_enabled.isChecked() if hasattr(self, 'mc_enabled') else self.auto_cleanup_checkbox.isChecked()
@@ -5265,11 +5303,13 @@ class MainWindow(QMainWindow):
             }
 
         from pipeline_manager import PipelineWorker
+        self.console_text.append(f"[ACCELERATION] {self.acceleration_profile.describe(gpu_mode)}")
         self.worker = PipelineWorker(
             image_dir, 
             output_dir, 
             quality_preset=quality_preset, 
             gpu_mode=gpu_mode, 
+            acceleration_profile=self.acceleration_profile,
             has_plain_surfaces=has_plain,
             auto_cleanup=auto_cleanup,
             manhattan_align=manhattan_align,
@@ -5777,10 +5817,7 @@ class MainWindow(QMainWindow):
                 if idx >= 0:
                     self.quality_combo.setCurrentIndex(idx)
             if "gpu_mode" in meta:
-                gpu_name = meta["gpu_mode"].capitalize()
-                idx = self.gpu_combo.findText(gpu_name)
-                if idx >= 0:
-                    self.gpu_combo.setCurrentIndex(idx)
+                self._restore_acceleration_selection(meta["gpu_mode"])
             if "has_plain_surfaces" in meta and meta["has_plain_surfaces"] and hasattr(self, 'mapper_combo'):
                 self.mapper_combo.setCurrentIndex(1)
             if "auto_cleanup" in meta:

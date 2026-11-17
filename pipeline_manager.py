@@ -6,7 +6,7 @@ in background threads to keep the UI responsive.
 Architecture:
   COLMAP Phase (Structure from Motion):
     1. Image Preparation          — downscale working copies to colmap/images/
-    2. Feature Extraction         — SIFT via iGPU (OpenGL) or CPU fallback
+    2. Feature Extraction         — SIFT via a verified selected GPU backend or CPU
     3. Feature Matching           — exhaustive matching with guided matching
     4. Mapper (SfM)               — incremental camera pose estimation + BA
        Bundle Adjuster            — optional extra polish (High/Ultra only)
@@ -34,6 +34,7 @@ import gc
 import psutil
 from PySide6.QtCore import QThread, Signal
 from hardware_profiler import run_safe_subprocess, get_memory_budget, get_recommended_matching_mode
+from acceleration import AccelerationProfile, normalize_selection, resolve_toolchain
 
 
 
@@ -119,12 +120,19 @@ class PipelineWorker(QThread):
         return target_idx < resume_idx
 
 
-    def __init__(self, image_dir: str, output_dir: str, quality_preset: str = "medium", gpu_mode: str = "auto", has_plain_surfaces: bool = False, auto_cleanup: bool = False, mapper_mode: str = "incremental", manhattan_align: bool = True, mesh_mode: str = "default", poisson_depth: int = 9, custom_params: dict = None, resume_from_step: str = None, parent=None):
+    def __init__(self, image_dir: str, output_dir: str, quality_preset: str = "medium", gpu_mode: str = "auto", has_plain_surfaces: bool = False, auto_cleanup: bool = False, mapper_mode: str = "incremental", manhattan_align: bool = True, mesh_mode: str = "default", poisson_depth: int = 9, custom_params: dict = None, resume_from_step: str = None, parent=None, acceleration_profile=None):
         super().__init__(parent)
         self.image_dir = os.path.abspath(image_dir) if image_dir else image_dir
         self.output_dir = os.path.abspath(output_dir) if output_dir else output_dir
         self.quality_preset = quality_preset
-        self.gpu_mode = gpu_mode
+        self.gpu_mode = normalize_selection(gpu_mode)
+        if acceleration_profile is None:
+            import hardware_profiler
+            acceleration_profile = hardware_profiler.acceleration_profile
+        self.acceleration_profile = acceleration_profile or AccelerationProfile()
+        self.execution_plan = self.acceleration_profile.resolve(self.gpu_mode)
+        self.stage_backends = {}
+        self.failure_reason = ""
         self.has_plain_surfaces = has_plain_surfaces
         self.auto_cleanup = auto_cleanup
         # When plain/smooth surfaces is selected, use GLOMAP global mapper instead of incremental mapper
@@ -153,7 +161,7 @@ class PipelineWorker(QThread):
         self._total_images = 0             # Total input images
         self._triangulated_points = 0      # 3D points from SfM
         self._mean_reproj_error = 0.0      # Mean reprojection error
-        self._using_gpu_sift = True        # Whether GPU SIFT is being used
+        self._using_gpu_sift = False       # Updated only when a stage actually runs
         self._depth_map_count = 0          # Number of depth maps computed
 
     def _get_throttled_sift_limits(self, total_images: int) -> tuple:
@@ -273,30 +281,7 @@ class PipelineWorker(QThread):
 
     def _normalize_toolchain_map(self, toolchain_map: dict) -> dict:
         """Resolve binary paths appropriately for host platform (Windows vs Linux/macOS)."""
-        import shutil
-        if sys.platform == "win32":
-            return toolchain_map
-
-        normalized = {}
-        for group, binaries in toolchain_map.items():
-            if not isinstance(binaries, dict):
-                normalized[group] = binaries
-                continue
-
-            normalized[group] = {}
-            for name, rel_path in binaries.items():
-                clean_rel_path = rel_path[:-4] if rel_path.lower().endswith(".exe") else rel_path
-                clean_abs_path = os.path.join(get_base_dir(), clean_rel_path)
-
-                if os.path.exists(clean_abs_path):
-                    normalized[group][name] = clean_abs_path
-                elif shutil.which(name):
-                    normalized[group][name] = shutil.which(name)
-                elif shutil.which(os.path.basename(clean_rel_path)):
-                    normalized[group][name] = shutil.which(os.path.basename(clean_rel_path))
-                else:
-                    normalized[group][name] = clean_abs_path
-        return normalized
+        return resolve_toolchain(get_base_dir(), toolchain_map)
 
     def _backup_checkpoint(self, step_name: str):
         try:
@@ -343,6 +328,12 @@ class PipelineWorker(QThread):
                 existing_meta["image_count"] = 0
             existing_meta["quality_preset"] = self.quality_preset
             existing_meta["gpu_mode"] = self.gpu_mode
+            existing_meta["acceleration"] = {
+                "version": 1,
+                "requested_selection": self.gpu_mode,
+                "selected_device_id": self.execution_plan.device.id if self.execution_plan.device else None,
+                "stage_backends": dict(self.stage_backends),
+            }
             existing_meta["has_plain_surfaces"] = self.has_plain_surfaces
             existing_meta["mapper_mode"] = self.mapper_mode
             existing_meta["mesh_mode"] = self.mesh_mode
@@ -367,8 +358,9 @@ class PipelineWorker(QThread):
                 self.log_message.emit("Valid toolchain detected. Running production pipeline...")
                 success = self._run_real_pipeline()
             else:
-                self.log_message.emit("Toolchain binaries or test data missing. Running pipeline simulation...")
-                success = self._run_simulated_pipeline()
+                self.failure_reason = "Required reconstruction tools are missing. Install the toolchain or check its configuration; existing checkpoints are preserved."
+                self.log_message.emit("[ERROR] " + self.failure_reason)
+                success = False
 
             if success:
                 self.progress_changed.emit(100)
@@ -376,7 +368,7 @@ class PipelineWorker(QThread):
                 self.finished.emit(True, "Mesh reconstruction completed.")
             else:
                 self.status_changed.emit("Pipeline Failed!")
-                self.finished.emit(False, "Pipeline failed or was cancelled.")
+                self.finished.emit(False, self.failure_reason or "Pipeline failed or was cancelled. See the processing log for details.")
 
         except Exception as e:
             self.status_changed.emit("Pipeline Error!")
@@ -425,23 +417,14 @@ class PipelineWorker(QThread):
 
     def _get_safe_env(self) -> dict:
         """
-        Build a sanitized subprocess environment with safe thread count and GPU settings.
+        Build a subprocess environment with a memory-budgeted thread count.
+        Stage adapters add explicit CPU/GPU device switches to commands.
         Used by OpenMVS tools and auxiliary pipeline workers.
         """
         env = os.environ.copy()
         mem_budget = get_memory_budget()
         num_threads = mem_budget.safe_thread_count
         env["OMP_NUM_THREADS"] = str(num_threads)
-        if self.gpu_mode == "force_cpu":
-            env["CUDA_VISIBLE_DEVICES"] = ""
-        elif self.gpu_mode != "force_gpu":
-            # auto
-            try:
-                parent_has_dgpu = self.parent().dgpu_detected if self.parent() else False
-            except Exception:
-                parent_has_dgpu = False
-            if not parent_has_dgpu:
-                env["CUDA_VISIBLE_DEVICES"] = ""
         return env
 
     def _run_process_realtime(self, cmd: list, timeout: float, cwd=None, env=None, line_parser=None) -> bool:
@@ -455,6 +438,14 @@ class PipelineWorker(QThread):
         import threading
         import glob
         from hardware_profiler import _active_subprocesses
+
+        self.last_process_outcome = "running"
+        self.failure_reason = ""
+        self.last_process_output = []
+        if not self.is_running:
+            self.last_process_outcome = "cancelled"
+            self.failure_reason = "Reconstruction cancelled."
+            return False
 
         cmd = self._adapt_colmap_cmd(cmd)
         self.log_message.emit(f"[RUN] {' '.join(cmd)}")
@@ -502,6 +493,9 @@ class PipelineWorker(QThread):
             else:
                 self.log_message.emit(clean_line)
             self.last_output_lines.append(clean_line)
+            self.last_process_output.append(clean_line)
+            if len(self.last_process_output) > 512:
+                del self.last_process_output[:-512]
             return True
 
         def stop_process():
@@ -515,6 +509,11 @@ class PipelineWorker(QThread):
                 proc.wait(timeout=2.0)
 
         try:
+            # Cancellation may arrive while adapting flags or preparing logs.
+            if not self.is_running:
+                self.last_process_outcome = "cancelled"
+                self.failure_reason = "Reconstruction cancelled."
+                return False
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -576,11 +575,15 @@ class PipelineWorker(QThread):
             stdout_done = False
             while True:
                 if not self.is_running:
+                    self.last_process_outcome = "cancelled"
+                    self.failure_reason = "Reconstruction cancelled."
                     stop_process()
                     return False
 
                 now = time.time()
                 if now - start_time > timeout:
+                    self.last_process_outcome = "timeout"
+                    self.failure_reason = f"{exe_name} timed out after {timeout}s. Existing checkpoints are preserved."
                     stop_process()
                     self.log_message.emit(f"[TIMEOUT] Process timed out after {timeout}s")
                     return False
@@ -589,6 +592,8 @@ class PipelineWorker(QThread):
                     last_mem_check = now
                     vm = psutil.virtual_memory()
                     if vm.percent > 96.0 or vm.available < (500 * 1024 * 1024):
+                        self.last_process_outcome = "memory_guard"
+                        self.failure_reason = f"Stopped {exe_name} to protect system memory ({vm.available / (1024**2):.0f} MB available). Existing checkpoints are preserved."
                         stop_process()
                         self.log_message.emit(
                             f"[CRITICAL OOM GUARD] System RAM usage reached {vm.percent:.1f}% "
@@ -633,9 +638,15 @@ class PipelineWorker(QThread):
 
                 time.sleep(0.02)
 
+            self.last_process_outcome = "success" if proc.returncode == 0 else "process_error"
+            if proc.returncode != 0:
+                detail = " | ".join(self.last_process_output[-5:])
+                self.failure_reason = f"{exe_name} failed (exit code {proc.returncode}). {detail}".strip()
             return proc.returncode == 0
 
         except Exception as e:
+            self.last_process_outcome = "spawn_error" if proc is None else "process_error"
+            self.failure_reason = f"Could not run {exe_name}: {e}"
             stop_process()
             self.log_message.emit(f"[ERROR] Failed to run subprocess: {e}")
             if sys.platform != 'win32' and cmd[0].endswith('.exe'):
@@ -706,25 +717,10 @@ class PipelineWorker(QThread):
             f"[MEMORY] Budgeted parallel worker threads: {num_threads} (Host Logical CPUs: {os.cpu_count() or 4})"
         )
 
-        # --- GPU / CUDA Environment (used mainly by OpenMVS) ---
-        env = os.environ.copy()
-        env["OMP_NUM_THREADS"] = str(num_threads)
-        if self.gpu_mode == "force_cpu":
-
-            self.log_message.emit("[INFO] Hardware Acceleration: Forcing CPU fallback.")
-            env["CUDA_VISIBLE_DEVICES"] = ""
-        elif self.gpu_mode == "force_gpu":
-            self.log_message.emit("[INFO] Hardware Acceleration: Forcing GPU (CUDA) execution.")
-        else:  # auto
-            try:
-                parent_has_dgpu = self.parent().dgpu_detected
-            except Exception:
-                parent_has_dgpu = False
-            if not parent_has_dgpu:
-                self.log_message.emit("[INFO] Hardware Acceleration: No dedicated GPU detected. Falling back to CPU.")
-                env["CUDA_VISIBLE_DEVICES"] = ""
-            else:
-                self.log_message.emit("[INFO] Hardware Acceleration: Dedicated GPU detected. Using CUDA.")
+        env = self._get_safe_env()
+        self.log_message.emit("[COMPUTE] " + self.execution_plan.describe())
+        for diagnostic in self.execution_plan.diagnostics[len(self.acceleration_profile.diagnostics):]:
+            self.log_message.emit("[COMPUTE] " + diagnostic)
 
         if self.has_plain_surfaces:
             self.mapper_mode = "global"
@@ -936,7 +932,7 @@ class PipelineWorker(QThread):
                 cmd_extract_gpu.extend(additional_flags)
                 cmd_extract_cpu.extend(additional_flags)
             self._feature_counts = []
-            if not self._run_with_gpu_fallback(
+            if not self._run_feature_stage(
                 cmd_extract_gpu, cmd_extract_cpu, timeout=14400.0, env=colmap_env,
                 line_parser=self._parse_feature_extraction_line
             ):
@@ -1077,20 +1073,22 @@ class PipelineWorker(QThread):
             ] + extra_args
 
             self._match_counts = []
-            if not self._run_with_gpu_fallback(
+            if not self._run_feature_stage(
                 cmd_match_gpu, cmd_match_cpu, timeout=14400.0, env=colmap_env,
                 line_parser=self._parse_matching_line
             ):
+                if not self.is_running or self.cpu_retry_failed or getattr(self, "last_process_outcome", None) != "process_error":
+                    return False
                 if matcher_cmd == "vocab_tree_matcher":
                     self.log_message.emit(
                         "[WARNING] vocab_tree_matcher failed during execution. Retrying automatically with exhaustive_matcher..."
                     )
                     matcher_cmd = "exhaustive_matcher"
-                    cmd_match_gpu = [arg for arg in cmd_match_gpu if not arg.startswith("--VocabTreeMatching")]
-                    cmd_match_cpu = [arg for arg in cmd_match_cpu if not arg.startswith("--VocabTreeMatching")]
+                    cmd_match_gpu = self._without_options(cmd_match_gpu, "--VocabTreeMatching")
+                    cmd_match_cpu = self._without_options(cmd_match_cpu, "--VocabTreeMatching")
                     cmd_match_gpu[1] = "exhaustive_matcher"
                     cmd_match_cpu[1] = "exhaustive_matcher"
-                    if not self._run_with_gpu_fallback(
+                    if not self._run_feature_stage(
                         cmd_match_gpu, cmd_match_cpu, timeout=14400.0, env=colmap_env,
                         line_parser=self._parse_matching_line
                     ):
@@ -1115,6 +1113,7 @@ class PipelineWorker(QThread):
                     line_parser=self._parse_matching_line
                 ):
                     return False
+                self.stage_backends["feature_matching"] = "CPU (relaxed matching retry)"
 
             db_stats = self._query_colmap_database_stats(database_path)
             if db_stats["num_images"] > 0:
@@ -1338,11 +1337,15 @@ class PipelineWorker(QThread):
             ]
             self._depth_map_count = 0
             self._dense_point_count = 0
-            densify_ok = self._run_process_realtime(cmd, timeout=7200.0, cwd=mvs_out, env=env, line_parser=self._parse_densify_line)
+            densify_ok = self._run_accelerated_stage("DensifyPointCloud", cmd, timeout=7200.0, cwd=mvs_out, env=env, line_parser=self._parse_densify_line)
             if not densify_ok:
-                self.log_message.emit("[WARNING] DensifyPointCloud failed or returned no points! ReconstructMesh will use sparse cloud.")
-            else:
-                self._emit_dense_summary()
+                self.log_message.emit("[ERROR] Dense reconstruction failed. Stopping; existing checkpoints are preserved.")
+                return False
+            if not os.path.isfile(os.path.join(mvs_out, "scene_dense.mvs")):
+                self.failure_reason = "Dense reconstruction produced no scene_dense.mvs. Stopping; existing checkpoints are preserved."
+                self.log_message.emit("[ERROR] " + self.failure_reason)
+                return False
+            self._emit_dense_summary()
             self._backup_checkpoint("dense_reconstruction")
             self.progress_changed.emit(80)
 
@@ -1360,7 +1363,11 @@ class PipelineWorker(QThread):
                 self.log_message.emit("[WARNING] Poisson reconstruction failed. Falling back to default OpenMVS Delaunay meshing pipeline...")
 
         dense_mvs = os.path.join(mvs_out, "scene_dense.mvs")
-        target_scene = "scene_dense.mvs" if os.path.exists(dense_mvs) else "scene.mvs"
+        target_scene = "scene_dense.mvs"
+        if not os.path.isfile(dense_mvs) and not self._should_skip("mesh_reconstructed"):
+            self.failure_reason = "The dense reconstruction checkpoint is missing. Retry dense reconstruction before meshing."
+            self.log_message.emit("[ERROR] " + self.failure_reason)
+            return False
 
         if self._should_skip("mesh_reconstructed"):
             self.log_message.emit("[RESUME] Skipping Step 7 (Surface Mesh Reconstruction already complete).")
@@ -1372,9 +1379,6 @@ class PipelineWorker(QThread):
         else:
             self.status_changed.emit(f"Step 7/{total_steps}: Reconstructing Surface Mesh...")
             mvs_mesh_exe = os.path.join(base_dir, self.toolchain_map["openMVS"]["ReconstructMesh"])
-
-            if target_scene == "scene.mvs":
-                self.log_message.emit("[WARNING] scene_dense.mvs not found. Meshing from sparse scene.mvs.")
 
             cmd = [
                 mvs_mesh_exe,
@@ -1434,7 +1438,7 @@ class PipelineWorker(QThread):
                 "--max-face-area", "16",
             ]
 
-            refine_ok = self._run_process_realtime(cmd, timeout=7200.0, cwd=mvs_out, env=env)
+            refine_ok = self._run_accelerated_stage("RefineMesh", cmd, timeout=7200.0, cwd=mvs_out, env=env)
             refined_mvs_path = os.path.join(mvs_out, refine_mvs_output)
             refined_ply_path = os.path.join(mvs_out, "scene_dense_mesh_refine.ply")
 
@@ -1442,8 +1446,10 @@ class PipelineWorker(QThread):
                 texture_input_scene = refine_mvs_output if os.path.exists(refined_mvs_path) else target_scene
                 self.log_message.emit(f"[INFO] RefineMesh succeeded. Using {texture_input_scene} for texturing.")
             else:
-                texture_input_scene = target_scene
-                self.log_message.emit(f"[WARNING] RefineMesh failed or produced no output. Texturing will use {target_scene}.")
+                if refine_ok:
+                    self.failure_reason = "Mesh refinement completed without producing an output mesh. Existing checkpoints are preserved."
+                self.log_message.emit("[ERROR] " + (self.failure_reason or "Mesh refinement failed. Existing checkpoints are preserved."))
+                return False
 
             self._backup_checkpoint("mesh_refined")
             self.progress_changed.emit(91 if self.auto_cleanup else 94)
@@ -1502,9 +1508,9 @@ class PipelineWorker(QThread):
                 break
 
         if not texture_mesh_ply:
-            self.log_message.emit("[WARNING] No mesh PLY found for texturing. Skipping TextureMesh.")
-            self.progress_changed.emit(99)
-            return True
+            self.failure_reason = "No mesh PLY was found for texturing. Reconstruction stopped; existing checkpoints are preserved."
+            self.log_message.emit("[ERROR] " + self.failure_reason)
+            return False
 
         cmd_ply = [
             mvs_texture_exe,
@@ -1518,9 +1524,6 @@ class PipelineWorker(QThread):
             "--global-seam-leveling", "0",
         ]
         texture_ply_ok = self._run_process_realtime(cmd_ply, timeout=1800.0, cwd=mvs_out, env=env)
-        if not texture_ply_ok:
-            self.log_message.emit("[WARNING] TextureMesh MVS/PLY pass failed. Final reconstruction may lack textures.")
-
         if texture_ply_ok:
             cmd_obj = [
                 mvs_texture_exe,
@@ -1534,7 +1537,9 @@ class PipelineWorker(QThread):
                 "--local-seam-leveling",  "0",
                 "--global-seam-leveling", "0",
             ]
-            self._run_process_realtime(cmd_obj, timeout=1800.0, cwd=mvs_out, env=env)
+            if not self._run_process_realtime(cmd_obj, timeout=1800.0, cwd=mvs_out, env=env):
+                self.log_message.emit("[ERROR] Textured OBJ export failed. Stopping; existing checkpoints are preserved.")
+                return False
 
             # Auto-export GLB via trimesh so scene_dense_mesh_texture.glb is immediately available
             try:
@@ -1549,55 +1554,11 @@ class PipelineWorker(QThread):
             except Exception as e:
                 self.log_message.emit(f"[WARNING] Automatic GLB conversion from OBJ skipped: {e}")
         else:
-            self.log_message.emit("[WARNING] TextureMesh PLY pass failed. Skipping OBJ export pass.")
+            self.log_message.emit("[ERROR] TextureMesh failed. Stopping; existing checkpoints are preserved.")
+            return False
 
         self.progress_changed.emit(99)
         self._backup_checkpoint("mesh_textured")
-        return True
-
-    def _run_simulated_pipeline(self) -> bool:
-        """Runs a visual simulation of the pipeline for testing UI and fallback states."""
-        if self.auto_cleanup:
-            steps = [
-                ("Step 1/10: Preparing Images...", 10, 0.8),
-                ("Step 2/10: Extracting SIFT Features...", 25, 1.2),
-                ("Step 3/10: Matching SIFT Features...", 40, 1.0),
-                ("Step 4/10: Estimating Camera Poses (SfM)...", 60, 1.5),
-                ("Step 5/10: Exporting Scene to OpenMVS...", 70, 0.6),
-                ("Step 6/10: Generating Dense Point Cloud...", 80, 1.5),
-                ("Step 7/10: Reconstructing Surface Mesh...", 88, 1.0),
-                ("Step 8/10: Refining Mesh Geometry...", 92, 1.0),
-                ("Step 9/10: Auto-Cleaning Mesh...", 96, 0.8),
-                ("Step 10/10: Projecting Textures onto Mesh...", 99, 0.8),
-            ]
-        else:
-            steps = [
-                ("Step 1/9: Preparing Images...", 10, 0.8),
-                ("Step 2/9: Extracting SIFT Features...", 25, 1.2),
-                ("Step 3/9: Matching SIFT Features...", 40, 1.0),
-                ("Step 4/9: Estimating Camera Poses (SfM)...", 60, 1.5),
-                ("Step 5/9: Exporting Scene to OpenMVS...", 70, 0.6),
-                ("Step 6/9: Generating Dense Point Cloud...", 80, 1.5),
-                ("Step 7/9: Reconstructing Surface Mesh...", 88, 1.0),
-                ("Step 8/9: Refining Mesh Geometry...", 94, 1.0),
-                ("Step 9/9: Projecting Textures onto Mesh...", 99, 0.8),
-            ]
-
-        for status, progress, duration in steps:
-            if not self.is_running:
-                return False
-            self.status_changed.emit(status)
-            self.log_message.emit(f"[SIM] {status.split(':')[0]}...")
-
-            ticks = int(duration * 10)
-            for _ in range(ticks):
-                if not self.is_running:
-                    return False
-                time.sleep(0.1)
-
-            self.log_message.emit(f"[SIM] {status.split(':')[0]} — done.")
-            self.progress_changed.emit(progress)
-
         return True
 
     def stop(self):
@@ -1698,20 +1659,137 @@ class PipelineWorker(QThread):
         )
         return working_dir
 
-    def _run_with_gpu_fallback(self, cmd_gpu: list, cmd_cpu: list, timeout: float, cwd=None, env=None, line_parser=None) -> bool:
-        """Try GPU first, fall back to CPU if GPU fails."""
-        if self.gpu_mode == "force_cpu":
+    def _stage_command(self, cmd, execution):
+        """Apply only switches advertised by this exact tool build."""
+        result = list(cmd)
+        args = execution.arguments()
+        for index in range(0, len(args), 2):
+            self._set_colmap_option(result, args[index], args[index + 1])
+        return result
+
+    @staticmethod
+    def _without_options(cmd, prefix):
+        """Remove both names and values when switching matcher implementations."""
+        result = []
+        index = 0
+        while index < len(cmd):
+            token = cmd[index]
+            if token.startswith(prefix):
+                index += 1 if "=" in token else 2
+            else:
+                result.append(token)
+                index += 1
+        return result
+
+    def _run_feature_stage(self, cmd_gpu, cmd_cpu, timeout, cwd=None, env=None, line_parser=None):
+        stage = "feature_extractor" if cmd_gpu[1] == "feature_extractor" else "feature_matching"
+        return self._run_accelerated_stage(stage, cmd_gpu, timeout, cwd, env, line_parser, cmd_cpu)
+
+    def _run_accelerated_stage(self, stage, cmd, timeout, cwd=None, env=None, line_parser=None, cmd_cpu=None):
+        """Execute this stage on the selected physical GPU or explicitly on CPU."""
+        execution = self.execution_plan.stages[stage]
+        cpu = execution.cpu()
+        cpu_command = self._stage_command(cmd_cpu or cmd, cpu)
+        cpu_env = dict(env if env is not None else self._get_safe_env())
+        cpu_env.update(cpu.environment())
+        self.cpu_retry_failed = False
+        if not execution.accelerated:
+            if stage in ("feature_extractor", "feature_matching"):
+                self._using_gpu_sift = False
+            self.log_message.emit(f"[COMPUTE] {stage}: CPU.")
+            ok = self._run_process_realtime(cpu_command, timeout, cwd=cwd, env=cpu_env, line_parser=line_parser)
+            self.stage_backends[stage] = "CPU" if ok else "Failed (CPU)"
+            return ok
+
+        gpu_env = dict(env if env is not None else self._get_safe_env())
+        gpu_env.update(execution.environment())
+        label = f"{self.execution_plan.device.name} ({execution.backend.upper()})"
+        previous_sift = self._using_gpu_sift
+        ok = self._run_with_gpu_fallback(
+            self._stage_command(cmd, execution), cpu_command, timeout,
+            cwd=cwd, env=gpu_env, cpu_env=cpu_env, line_parser=line_parser,
+            backend_label=label)
+        if ok and self._using_gpu_sift and any(
+            marker in line.lower()
+            for line in getattr(self, "last_process_output", [])
+            for marker in ("falling back to cpu", "using cpu implementation",
+                           "creating sift cpu feature", "using cpu for depth")
+        ):
+            self._using_gpu_sift = False
+            self.log_message.emit(f"[COMPUTE] {stage}: the tool reported an internal CPU fallback.")
+        actual = label if self._using_gpu_sift else "CPU (GPU fallback)"
+        self.stage_backends[stage] = actual if ok else f"Failed ({actual})"
+        if stage not in ("feature_extractor", "feature_matching"):
+            self._using_gpu_sift = previous_sift
+        if ok:
+            self.log_message.emit(f"[COMPUTE] {stage} completed using {actual}.")
+        return ok
+
+    def _run_with_gpu_fallback(self, cmd_gpu: list, cmd_cpu: list, timeout: float, cwd=None, env=None, line_parser=None, backend_label="GPU", cpu_env=None) -> bool:
+        """Retry on CPU only when this command reports a GPU backend failure.
+
+        A timeout, cancellation, RAM guard, launch failure or ordinary processing
+        error must remain terminal; retrying those can repeat unsafe work or hide
+        the original error. The selected GPU remains a preference even in the
+        legacy ``force_gpu`` mode.
+        """
+        self.cpu_retry_failed = False
+        if not self.is_running:
+            self.last_process_outcome = "cancelled"
+            self.failure_reason = "Reconstruction cancelled."
+            return False
+        if self.gpu_mode in ("cpu", "force_cpu"):
             self.log_message.emit("[INFO] CPU-only mode selected. Skipping GPU execution.")
             self._using_gpu_sift = False
-            return self._run_process_realtime(cmd_cpu, timeout=timeout, cwd=cwd, env=env, line_parser=line_parser)
+            return self._run_process_realtime(cmd_cpu, timeout=timeout, cwd=cwd, env=cpu_env if cpu_env is not None else env, line_parser=line_parser)
 
-        self.log_message.emit("[INFO] Attempting GPU-accelerated execution (OpenGL)...")
+        self.log_message.emit(f"[INFO] Attempting {backend_label}-accelerated execution...")
         self._using_gpu_sift = True
+        # Clear per-attempt state so an earlier command cannot trigger fallback.
+        self.last_process_outcome = None
+        self.last_process_output = []
         if self._run_process_realtime(cmd_gpu, timeout=timeout, cwd=cwd, env=env, line_parser=line_parser):
             return True
-        self.log_message.emit("[WARNING] GPU execution failed. Falling back to CPU-only mode...")
+        if not self.is_running:
+            self.last_process_outcome = "cancelled"
+            self.failure_reason = "Reconstruction cancelled."
+            return False
+        if self.last_process_outcome != "process_error":
+            return False
+
+        evidence = self._retryable_gpu_failure()
+        if not evidence:
+            return False
+        self.log_message.emit(f"[WARNING] GPU backend failed: {evidence}")
+        self.log_message.emit("[WARNING] Retrying this stage on CPU. Other unsupported stages also use CPU.")
         self._using_gpu_sift = False
-        return self._run_process_realtime(cmd_cpu, timeout=timeout, cwd=cwd, env=env, line_parser=line_parser)
+        ok = self._run_process_realtime(cmd_cpu, timeout=timeout, cwd=cwd, env=cpu_env if cpu_env is not None else env, line_parser=line_parser)
+        self.cpu_retry_failed = not ok
+        if not ok and self.is_running:
+            self.log_message.emit("[ERROR] CPU retry failed. Reconstruction will stop; existing checkpoints are preserved.")
+        return ok
+
+    def _retryable_gpu_failure(self):
+        """Return current-command GPU failure evidence, or None for terminal errors."""
+        if not self.is_running or getattr(self, "last_process_outcome", None) != "process_error":
+            return None
+        backend_failures = (
+            "cuda error", "cuda runtime error", "cudaerror",
+            "cuda driver version is insufficient", "cuda driver initialization failed",
+            "cuda driver not found",
+            "no cuda-capable device", "no cuda devices", "cuda device not found",
+            "failed to create siftgpu", "siftgpu not fully supported",
+            "siftgpu not supported", "siftgpu initialization failed",
+            "failed to initialize siftgpu", "failed to initialize opengl",
+            "opengl context creation failed", "failed to create opengl context",
+            "failed to create an opengl context", "failed to create a cuda context",
+            "hip error", "hiperror", "hip runtime error", "no hip devices",
+            "metal device not found", "failed to create metal device",
+            "metal command buffer failed", "metal command buffer error",
+        )
+        evidence = next((line for line in getattr(self, "last_process_output", [])
+                         if any(marker in line.lower() for marker in backend_failures)), None)
+        return evidence
 
     def _get_colmap_help(self, colmap_exe: str, subcommand: str) -> str:
         """Fetch and cache colmap <subcommand> -h output to inspect supported CLI option flags."""
@@ -1925,7 +2003,7 @@ class PipelineWorker(QThread):
                 name_match = re.search(r'name=(\S+)', line)
                 img_name = name_match.group(1) if name_match else f"image {current}"
                 
-                gpu_label = "[iGPU]" if self._using_gpu_sift else "[CPU]"
+                gpu_label = "[GPU]" if self._using_gpu_sift else "[CPU]"
                 return f"{gpu_label} {img_name}: {num_features:,} features ({current}/{total})"
         
         # Match: timing information
@@ -2251,7 +2329,7 @@ class PipelineWorker(QThread):
         min_f = min(self._feature_counts)
         max_f = max(self._feature_counts)
 
-        compute_label = "GPU (CUDA)" if self._using_gpu_sift else "CPU Fallback"
+        compute_label = self.stage_backends.get("feature_extractor", "Previously completed (backend not recorded)")
         
         self.log_message.emit(
             f"\n{'='*60}\n"

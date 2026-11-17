@@ -246,6 +246,9 @@ find "$OPT_DIR/backend_bin" -type d -empty -delete 2>/dev/null || true
 if [ -f "toolchain_map.json" ]; then
     cp "toolchain_map.json" "$OPT_DIR/"
 fi
+if [ -f "toolchain_capabilities.json" ]; then
+    cp "toolchain_capabilities.json" "$OPT_DIR/"
+fi
 if [ -d "backend_bin/sp_lg_weights" ]; then
     mkdir -p "$OPT_DIR/backend_bin/sp_lg_weights"
     cp -r backend_bin/sp_lg_weights/* "$OPT_DIR/backend_bin/sp_lg_weights/" 2>/dev/null || true

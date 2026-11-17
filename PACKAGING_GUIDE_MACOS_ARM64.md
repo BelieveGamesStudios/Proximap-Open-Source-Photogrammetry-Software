@@ -84,8 +84,8 @@ brew install qt
 # Image libraries (for OpenMVS and general image processing)
 brew install opencv boost libjpeg-turbo openexr webp
 
-# Optional: for GPU acceleration (Metal support on Apple Silicon)
-brew install metal-sdk
+# Metal headers/frameworks come from Apple's developer tools and macOS SDK.
+# Use a Metal-capable OpenMVS build for GPU depth-map estimation.
 
 # Tools for DMG creation
 brew install create-dmg
@@ -212,18 +212,18 @@ cd build
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
-  -DBUILD_TESTING=OFF \
-  -DWITH_CUDA=OFF \
-  -DWITH_OPENGL=ON \
+  -DTESTS_ENABLED=OFF \
+  -DCUDA_ENABLED=OFF \
+  -DOPENGL_ENABLED=ON \
   -DQt6_DIR=$(brew --prefix qt6)/lib/cmake/Qt6
 ```
 
 **Flag Explanations:**
 - `-DCMAKE_BUILD_TYPE=Release`: Optimized binary
 - `-DCMAKE_OSX_ARCHITECTURES=arm64`: ARM64 only
-- `-DBUILD_TESTING=OFF`: Skip test compilation (saves time)
-- `-DWITH_CUDA=OFF`: Apple Silicon doesn't support native CUDA (Metal support available in newer COLMAP versions)
-- `-DWITH_OPENGL=ON`: GUI rendering
+- `-DTESTS_ENABLED=OFF`: Skip test compilation (saves time)
+- `-DCUDA_ENABLED=OFF`: Disable CUDA on Apple Silicon; Proximap uses CPU for COLMAP features without a supported compute backend.
+- `-DOPENGL_ENABLED=ON`: GUI rendering; this does not establish a selectable Metal compute backend.
 
 4. Build:
 
@@ -276,10 +276,18 @@ cd build
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
-  -DBUILD_TESTS=OFF \
-  -DENABLE_CUDA=OFF \
-  -DENABLE_CERES=ON
+  -DOpenMVS_ENABLE_TESTS=OFF \
+  -DOpenMVS_USE_CUDA=OFF \
+  -DOpenMVS_USE_CERES=ON
 ```
+
+Current OpenMVS development builds enable Metal when the Metal/Foundation
+frameworks are found. Verify the exact version being packaged and its build
+configuration. Follow [acceleration setup](docs/hardware-acceleration.md) to
+record capabilities for ambiguous GPU switches; adding a dropdown option alone
+does not enable Metal. See the upstream
+[OpenMVS build configuration](https://github.com/cdcseacave/openMVS/blob/develop/CMakeLists.txt)
+and [COLMAP build options](https://github.com/colmap/colmap/blob/main/CMakeLists.txt).
 
 4. Build (this can take 1-2 hours):
 

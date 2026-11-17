@@ -171,6 +171,9 @@ if (Test-Path "backend_bin/python3.10") {
 # Copy toolchain mapping configuration
 Write-Host "  Copying toolchain map configuration..." -ForegroundColor DarkGray
 Copy-Item -Path "toolchain_map.json" -Destination "dist/Proximap/"
+if (Test-Path "toolchain_capabilities.json") {
+    Copy-Item -Path "toolchain_capabilities.json" -Destination "dist/Proximap/"
+}
 
 # Copy application icon for runtime usage
 if (Test-Path "app_icon.ico") {

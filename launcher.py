@@ -6,6 +6,14 @@ import os
 import sys
 import ctypes
 
+if __name__ == "__main__" and "--acceleration-inventory" in sys.argv:
+    # Run native driver probes in a bounded child, before importing Qt. A file
+    # also works in windowed bundles where sys.stdout is unavailable.
+    from acceleration import _print_inventory
+    _inventory_arg = sys.argv.index("--acceleration-inventory")
+    _print_inventory(output_path=sys.argv[_inventory_arg + 1])
+    raise SystemExit(0)
+
 class DummyStream:
     def write(self, data):
         pass

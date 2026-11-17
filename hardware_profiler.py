@@ -1,18 +1,14 @@
 """
 Hardware Profiler Utility Module
-This module handles hardware diagnostics, memory constraint checks, OpenMVG version validations,
-and GPU benchmarking.
+This module handles hardware diagnostics, memory constraint checks, COLMAP version validation,
+and reconstruction acceleration capabilities.
 """
 
 import os
 import sys
-import time
-import signal
 import atexit
 import subprocess
 import psutil
-import numpy as np
-import concurrent.futures
 from collections import namedtuple
 
 
@@ -180,295 +176,22 @@ def validate_colmap_version(colmap_binary_path: str) -> bool:
     return True
 
 
-def check_nvidia_gputil() -> list:
-    """Attempts to discover NVIDIA GPUs using GPUtil."""
-    try:
-        import GPUtil
-        gpus = GPUtil.getGPUs()
-        return [gpu.name for gpu in gpus]
-    except Exception:
-        return []
+# Populated on the startup worker; importing this module never probes hardware.
+from acceleration import AccelerationProfile, discover_profile
 
+acceleration_profile = AccelerationProfile()
 
-def check_nvidia_smi() -> list:
-    """Attempts to discover NVIDIA GPUs using nvidia-smi command line utility."""
-    paths = [
-        "nvidia-smi",
-        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
-        r"C:\Windows\System32\nvidia-smi.exe"
-    ]
-    for path in paths:
-        try:
-            ret, stdout, stderr = run_safe_subprocess(
-                [path, "--query-gpu=name", "--format=csv,noheader"],
-                timeout=5.0
-            )
-            if ret == 0 and stdout:
-                return [line.strip() for line in stdout.splitlines() if line.strip()]
-        except Exception:
-            pass
-    return []
-
-
-def check_rocm_smi() -> list:
-    """Attempts to discover AMD GPUs using rocm-smi command line utility."""
-    try:
-        ret, stdout, stderr = run_safe_subprocess(
-            ["rocm-smi", "--showproductname"],
-            timeout=5.0
-        )
-        if ret == 0 and stdout:
-            names = []
-            for line in stdout.splitlines():
-                if "Product Name:" in line or "Card" in line:
-                    names.append(line.strip())
-            return names
-    except Exception:
-        pass
-    return []
-
-
-def check_gpus_wmic() -> list:
-    """Queries Windows WMI for installed video controllers."""
-    gpus = []
-    try:
-        ret, stdout, stderr = run_safe_subprocess(
-            ["wmic", "path", "win32_VideoController", "get", "name"],
-            timeout=5.0
-        )
-        if ret == 0 and stdout:
-            lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-            if len(lines) > 1:
-                gpus = lines[1:]  # Skip header "Name"
-    except Exception:
-        pass
-    return gpus
-
-
-def check_gpus_powershell() -> list:
-    """Queries Windows PowerShell Get-CimInstance for installed video controllers."""
-    gpus = []
-    if sys.platform != 'win32':
-        return gpus
-    try:
-        ret, stdout, stderr = run_safe_subprocess(
-            ["powershell", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
-            timeout=5.0
-        )
-        if ret == 0 and stdout:
-            gpus = [line.strip() for line in stdout.splitlines() if line.strip()]
-    except Exception:
-        pass
-    return gpus
-
-
-def detect_gpus() -> tuple:
-    """
-    Scans the system for NVIDIA and AMD GPUs in parallel.
-    Returns:
-        tuple: (list of dedicated GPUs, list of integrated GPUs)
-    """
-    funcs = [
-        check_nvidia_gputil,
-        check_nvidia_smi,
-        check_rocm_smi,
-        check_gpus_wmic,
-        check_gpus_powershell
-    ]
-    
-    all_names = set()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(funcs)) as executor:
-        futures = {executor.submit(func): func for func in funcs}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                names = future.result()
-                if names:
-                    all_names.update(names)
-            except Exception:
-                pass
-    
-    dgpus = []
-    igpus = []
-    
-    for name in all_names:
-        name_upper = name.upper()
-        # Classify as integrated/fallback if it fits integrated signatures
-        is_integrated = False
-        if "INTEL" in name_upper or "IRIS" in name_upper or "HD GRAPHICS" in name_upper:
-            is_integrated = True
-        elif "AMD RADEON(TM) GRAPHICS" in name_upper or "RADEON VEGA" in name_upper or "APU" in name_upper:
-            is_integrated = True
-        elif "APPLE" in name_upper:
-            is_integrated = True
-            
-        # dGPU checks
-        is_dgpu_brand = (
-            "NVIDIA" in name_upper or 
-            "AMD" in name_upper or 
-            "RADEON" in name_upper or 
-            "GEFORCE" in name_upper or 
-            "QUADRO" in name_upper or 
-            "TESLA" in name_upper
-        )
-        
-        if is_dgpu_brand and not is_integrated:
-            dgpus.append(name)
-        else:
-            igpus.append(name)
-            
-    return dgpus, igpus
-
-
-def run_matrix_multiplication_benchmark() -> dict:
-    """
-    Runs a matrix multiplication compute micro-benchmark targeting exactly 1.0 second.
-    Attempts to run on CUDA/GPU via torch or cupy if available, with a NumPy fallback.
-    Returns a dict with performance stats.
-    """
-    # 1. Try PyTorch (CUDA)
-    try:
-        import torch
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-            # 2048x2048 is a solid matrix size for modern GPUs
-            N = 2048
-            a = torch.randn(N, N, device=device, dtype=torch.float32)
-            b = torch.randn(N, N, device=device, dtype=torch.float32)
-            
-            # Warmup
-            _ = torch.matmul(a, b)
-            torch.cuda.synchronize()
-            
-            iterations = 0
-            start_time = time.time()
-            end_time = start_time + 1.0
-            
-            while time.time() < end_time:
-                _ = torch.matmul(a, b)
-                iterations += 1
-                
-            torch.cuda.synchronize()
-            elapsed = time.time() - start_time
-            
-            # 2 * N^3 operations per multiplication
-            ops_per_iter = 2 * (N ** 3)
-            total_ops = iterations * ops_per_iter
-            gflops = (total_ops / elapsed) / 1e9
-            
-            return {
-                "backend": "PyTorch (CUDA)",
-                "iterations": iterations,
-                "elapsed_seconds": elapsed,
-                "gflops": gflops
-            }
-    except Exception:
-        pass
-
-    # 2. Try CuPy (CUDA/ROCm)
-    try:
-        import cupy as cp
-        N = 2048
-        a = cp.random.randn(N, N, dtype=cp.float32)
-        b = cp.random.randn(N, N, dtype=cp.float32)
-        
-        # Warmup
-        _ = cp.dot(a, b)
-        cp.cuda.Stream.null.synchronize()
-        
-        iterations = 0
-        start_time = time.time()
-        end_time = start_time + 1.0
-        
-        while time.time() < end_time:
-            _ = cp.dot(a, b)
-            iterations += 1
-            
-        cp.cuda.Stream.null.synchronize()
-        elapsed = time.time() - start_time
-        
-        ops_per_iter = 2 * (N ** 3)
-        total_ops = iterations * ops_per_iter
-        gflops = (total_ops / elapsed) / 1e9
-        
-        return {
-            "backend": "CuPy",
-            "iterations": iterations,
-            "elapsed_seconds": elapsed,
-            "gflops": gflops
-        }
-    except Exception:
-        pass
-
-    # 3. Fallback to NumPy (CPU)
-    # Using a smaller matrix size (e.g. 512x512) for CPU to avoid excessive thread load
-    try:
-        N = 512
-        a = np.random.randn(N, N).astype(np.float32)
-        b = np.random.randn(N, N).astype(np.float32)
-        
-        # Warmup
-        _ = np.dot(a, b)
-        
-        iterations = 0
-        start_time = time.time()
-        end_time = start_time + 1.0
-        
-        while time.time() < end_time:
-            _ = np.dot(a, b)
-            iterations += 1
-            
-        elapsed = time.time() - start_time
-        ops_per_iter = 2 * (N ** 3)
-        total_ops = iterations * ops_per_iter
-        gflops = (total_ops / elapsed) / 1e9
-        
-        return {
-            "backend": "NumPy (CPU-Fallback)",
-            "iterations": iterations,
-            "elapsed_seconds": elapsed,
-            "gflops": gflops
-        }
-    except Exception as e:
-        return {
-            "backend": "None",
-            "iterations": 0,
-            "elapsed_seconds": 0.0,
-            "gflops": 0.0,
-            "error": str(e)
-        }
-
-
-# Global/module initialization placeholders
-dedicated_gpus = []
-integrated_gpus = []
-use_low_hardware_fallback = True
-gpu_perf_stats = None
 
 def initialize():
-    """
-    Performs the intensive hardware profiling scans and benchmarks.
-    This should be called off the main thread at application startup.
-    """
-    global dedicated_gpus, integrated_gpus, use_low_hardware_fallback, gpu_perf_stats
-    dedicated_gpus_found, integrated_gpus_found = detect_gpus()
-    dedicated_gpus = dedicated_gpus_found
-    integrated_gpus = integrated_gpus_found
-    if len(dedicated_gpus) > 0:
-        use_low_hardware_fallback = False
-        gpu_perf_stats = run_matrix_multiplication_benchmark()
-    else:
-        use_low_hardware_fallback = True
-        gpu_perf_stats = None
+    """Inspect devices and the resolved reconstruction tools off the UI thread."""
+    global acceleration_profile
+    base_dir = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+    acceleration_profile = discover_profile(base_dir)
 
 
 if __name__ == "__main__":
     initialize()
-    print("=== Hardware Profiler Status ===")
-    print(f"Available Memory: {get_available_memory() / (1024**3):.2f} GB")
-    print(f"Dedicated GPUs Found: {dedicated_gpus}")
-    print(f"Integrated/Other GPUs Found: {integrated_gpus}")
-    print(f"Use Low Hardware Fallback: {use_low_hardware_fallback}")
-    if gpu_perf_stats:
-        print(f"Micro-Benchmark Stats:")
-        for k, v in gpu_perf_stats.items():
-            print(f"  {k}: {v}")
+    print(acceleration_profile.describe("auto"))
+    for diagnostic in acceleration_profile.diagnostics:
+        print(diagnostic)

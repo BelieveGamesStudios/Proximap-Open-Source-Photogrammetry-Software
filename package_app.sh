@@ -180,6 +180,9 @@ echo "  Copying toolchain map configuration..."
 if [ -f "toolchain_map.json" ]; then
     cp "toolchain_map.json" "$MAC_OS_DIR/"
 fi
+if [ -f "toolchain_capabilities.json" ]; then
+    cp "toolchain_capabilities.json" "$MAC_OS_DIR/"
+fi
 
 echo "  Copying application icon for runtime usage..."
 if [ -f "app_icon.ico" ]; then
